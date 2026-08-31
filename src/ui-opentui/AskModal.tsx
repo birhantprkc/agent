@@ -163,10 +163,11 @@ export function AskModal({ req }: { req: AskRequest }) {
                   </text>
                 </box>
               ) : (
-                <box style={{ flexDirection: 'row' }}>
+                <box style={{ flexDirection: 'row', width: '100%' }}>
                   <text
                     fg={selected ? theme.focus : theme.text}
-                    attributes={selected ? TextAttributes.BOLD : TextAttributes.DIM}
+                    attributes={selected ? TextAttributes.BOLD : undefined}
+                    truncate={false}
                   >
                     {selected ? ` ${theme.glyphs.caret} ` : '   '}
                     {o.label}

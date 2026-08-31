@@ -19,9 +19,9 @@ export const theme = {
   /** Focus / selection — active menus, modal frames. Same hue as brand. */
   focus: CLAUDE_CORAL,
   /** Primary readable text. */
-  text: 'white' as const,
+  text: '#FFFFFF' as const,
   /** Secondary / dim copy. */
-  muted: 'gray' as const,
+  muted: '#A0A0A0' as const,
   success: 'green' as const,
   warning: 'yellow' as const,
   error: 'red' as const,
