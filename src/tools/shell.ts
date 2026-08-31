@@ -4,13 +4,14 @@
 // keep context windows sane.
 
 import { spawn } from 'node:child_process';
+import type { BackgroundTaskManager } from '../agent/backgroundTasks.js';
 import type { Prompter } from '../permission/permission.js';
 import { decodeUtf8Capped } from './file.js';
-import { type Tool, argString } from './types.js';
+import { type Tool, argBool, argString } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_TIMEOUT_MS = 30 * 60 * 1000;
-const MAX_OUTPUT_BYTES = 64 * 1024;
+export const MAX_OUTPUT_BYTES = 64 * 1024;
 
 // Windows has no /bin/sh or /bin/bash, so spawning the Unix shell path fails
 // with `ENOENT: no such file or directory, uv_spawn '/bin/sh'`. On Windows we
@@ -18,7 +19,7 @@ const MAX_OUTPUT_BYTES = 64 * 1024;
 // tool descriptions assume than cmd.exe, and supports pipelines/quoting cleanly.
 // Override with PFLOW_WINDOWS_SHELL (e.g. "pwsh.exe" or "%ComSpec%") if needed.
 // Evaluated at call time (not module load) so tests can exercise both paths.
-function isWindows(): boolean {
+export function isWindows(): boolean {
   return process.platform === 'win32';
 }
 
@@ -114,10 +115,12 @@ const GREP_P_RE =
 export class ShellTool implements Tool {
   private readonly shellPath: string;
   private readonly toolName: string;
+  private readonly background?: BackgroundTaskManager;
 
-  constructor(shell = '/bin/sh', toolName = 'shell') {
+  constructor(shell = '/bin/sh', toolName = 'shell', background?: BackgroundTaskManager) {
     this.shellPath = shell;
     this.toolName = toolName;
+    this.background = background;
   }
 
   name(): string {
@@ -155,6 +158,11 @@ export class ShellTool implements Tool {
           type: 'integer',
           description: 'Optional timeout in seconds (default 300, max 1800).',
         },
+        background: {
+          type: 'boolean',
+          description:
+            'Run detached and return a task id immediately instead of waiting for it to finish. Use for a long scan (large ffuf/nuclei sweep) that would otherwise block the whole turn. Check progress with background_status, or wait for the completion notice.',
+        },
       },
       required: ['command'],
     };
@@ -174,9 +182,14 @@ export class ShellTool implements Tool {
 
   summarize(args: Record<string, unknown>): { summary: string; detail: string } {
     const cmd = rewritePortableCommand(argString(args, 'command'));
-    const firstLine = cmd.split('\n', 1)[0] ?? '';
-    const truncated = firstLine.length > 120 ? `${firstLine.slice(0, 117)}...` : firstLine;
-    return { summary: `${this.toolName}: ${truncated}`, detail: cmd };
+    // Modal shows full command in a code box; summary is a short risk label
+    // (not a second copy of the same one-liner).
+    const first = (cmd.split('\n', 1)[0] ?? '').trim();
+    const verb = first.split(/\s+/, 1)[0] || 'command';
+    return {
+      summary: `Run ${verb} on this machine`,
+      detail: cmd,
+    };
   }
 
   async run(args: Record<string, unknown>, signal: AbortSignal, _p: Prompter): Promise<string> {
@@ -206,6 +219,19 @@ export class ShellTool implements Tool {
     }
 
     const { cmd, argv } = shellInvocation(this.shellPath, cmdStr);
+    if (argBool(args, 'background')) {
+      if (!this.background) {
+        throw new Error('background execution is not available in this session');
+      }
+      const label = cmdStr.split('\n', 1)[0] ?? cmdStr;
+      const { id } = this.background.start(
+        cmd,
+        argv,
+        timeoutMs,
+        label.length > 80 ? `${label.slice(0, 80)}…` : label,
+      );
+      return `started as background task ${id} — check progress with background_status (action="get", id="${id}"), or wait for the completion notice.`;
+    }
     return runWithCapture(cmd, argv, timeoutMs, signal);
   }
 }
@@ -277,8 +303,8 @@ function shellQuote(value: string): string {
 
 /** BashTool is a PascalCase alias for ShellTool that uses /bin/bash. */
 export class BashTool extends ShellTool {
-  constructor() {
-    super('/bin/bash', 'BashTool');
+  constructor(background?: BackgroundTaskManager) {
+    super('/bin/bash', 'BashTool', background);
   }
 
   override description(): string {
@@ -359,7 +385,7 @@ function runWithCapture(
   });
 }
 
-function killProcessGroup(pid: number): void {
+export function killProcessGroup(pid: number): void {
   if (!pid) return;
   if (isWindows()) {
     // No POSIX signals/process groups on Windows; taskkill /T tears down the
@@ -389,7 +415,7 @@ function killProcessGroup(pid: number): void {
  * codepoint boundaries instead of mid-character. Memory is bounded to ~cap plus
  * one chunk regardless of total stream size.
  */
-class HeadTailBuffer {
+export class HeadTailBuffer {
   private readonly half: number;
   private readonly head: Buffer[] = [];
   private headLen = 0;
@@ -460,7 +486,7 @@ function decodeUtf8Tail(buf: Buffer): string {
   return buf.subarray(start).toString('utf8');
 }
 
-function signalToInt(sig: NodeJS.Signals): number {
+export function signalToInt(sig: NodeJS.Signals): number {
   // Best-effort mapping for the most common signals so the exit code is
   // still meaningful in the tool output.
   switch (sig) {

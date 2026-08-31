@@ -6,10 +6,11 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 let renderMarkdown: typeof import('./markdown.js').renderMarkdown;
+let resolveFenceLang: typeof import('./markdown.js').resolveFenceLang;
 
 beforeAll(async () => {
   vi.stubEnv('NO_COLOR', '');
-  ({ renderMarkdown } = await import('./markdown.js'));
+  ({ renderMarkdown, resolveFenceLang } = await import('./markdown.js'));
 });
 
 // ESC is 0x1B; build the strip regex from a char-code so Biome's
@@ -90,6 +91,16 @@ describe('renderMarkdown', () => {
     expect(stripAnsi(out)).toContain('**not bold here**');
   });
 
+  it('resolves common fence language aliases', () => {
+    expect(resolveFenceLang('js')).toBe('javascript');
+    expect(resolveFenceLang('ts')).toBe('typescript');
+    expect(resolveFenceLang('py')).toBe('python');
+    expect(resolveFenceLang('sh')).toBe('bash');
+    expect(resolveFenceLang('python title="x"')).toBe('python');
+    expect(resolveFenceLang('js{1,3}')).toBe('javascript');
+    expect(resolveFenceLang('madeup-lang-9999')).toBe('');
+  });
+
   it('syntax-highlights a fenced bash block', () => {
     const input = '```bash\ncurl -s https://example.com | jq .\n```';
     const out = renderMarkdown(input);
@@ -99,6 +110,12 @@ describe('renderMarkdown', () => {
     expect(ansiCount).toBeGreaterThan(1);
     expect(stripAnsi(out)).toContain('curl');
     expect(stripAnsi(out)).toContain('https://example.com');
+  });
+
+  it('syntax-highlights js alias the same as javascript', () => {
+    const out = renderMarkdown('```js\nconst x = 1;\n```');
+    expect(stripAnsi(out)).toContain('const x = 1');
+    expect((out.match(new RegExp(`${ESC}\\[`, 'g')) ?? []).length).toBeGreaterThan(1);
   });
 
   it('syntax-highlights a fenced python block', () => {

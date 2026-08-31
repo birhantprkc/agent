@@ -14,15 +14,21 @@
 // body is masked.
 const patterns: RegExp[] = [
   // Bearer token in Authorization header or freeform text.
-  /(bearer\s+)([A-Za-z0-9._-]{16,})/gi,
+  /(bearer\s+)([A-Za-z0-9._\-+/=]{16,})/gi,
   // Authorization: <scheme> <value> header line.
   /(authorization:\s*)(\S+\s+\S+)/gi,
   // AWS access key id.
   /\b(AKIA|ASIA)([0-9A-Z]{16})\b/g,
-  // AWS secret access key adjacent to a key= marker.
+  // AWS secret access key adjacent to a key= marker (snake_case, e.g. env
+  // vars / .aws/credentials) and camelCase (e.g. SDK config / JSON —
+  // `"secretAccessKey": "wJalr..."` doesn't match the snake_case form since
+  // the literal underscores aren't present).
   /(aws_secret_access_key\s*[:=]\s*["']?)([A-Za-z0-9/+=]{40})/gi,
-  // GitHub personal / oauth / server tokens.
+  /(secretAccessKey\s*[:=]\s*["']?)([A-Za-z0-9/+=]{40})/g,
+  // GitHub personal / oauth / server tokens (ghp_/gho_/… classic).
   /\b(gh[pousr]_)([A-Za-z0-9]{36,255})\b/g,
+  // GitHub fine-grained personal access tokens (github_pat_…).
+  /\b(github_pat_)([A-Za-z0-9_]{20,})\b/g,
   // Stripe live / test keys.
   /\b(sk_(?:live|test)_)([A-Za-z0-9]{16,})\b/g,
   // OpenAI-style project and legacy keys.
@@ -43,11 +49,26 @@ const patterns: RegExp[] = [
   /\b(eyJ[A-Za-z0-9_-]{8,}\.)([A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?)\b/g,
   // Generic api_key / secret / password / token = value assignment.
   /((?:api[_-]?key|secret|password|passwd|token)\s*[:=]\s*["']?)([A-Za-z0-9._\-+/=]{16,})/gi,
+  // Bare session/cookie identifiers outside a Cookie:/Set-Cookie: header —
+  // `"session_id": "a1b2c3..."`, `PHPSESSID=deadbeef...`, `JSESSIONID=...`.
+  // This is exactly the artifact type a pentest transcript accumulates
+  // constantly (evidence of a hijackable session), and none of the other
+  // patterns here catch a bare field/word like this. Lower length floor than
+  // the generic assignment pattern (8 vs 16) since session identifiers can be
+  // shorter than typical API keys.
+  /((?:session[_-]?id|sid|phpsessid|jsessionid)\s*[:=]\s*["']?)([A-Za-z0-9._\-+/=]{8,})/gi,
   // Credentials carried as URL/connection-string query parameters, e.g.
   // `mongodb+srv://h/db?authSource=admin&password=hunter2` or `?auth=...&token=...`.
   // The generic assignment above needs a 16+ char value; here we mask even a
   // short query-param secret since the `&`/`#`/whitespace delimiter bounds it (E25).
-  /([?&](?:password|passwd|pwd|auth|token|api[_-]?key|access_token|secret)=)([^&#\s"']+)/gi,
+  // Includes OAuth `code`/`id_token` — the [?&] anchor requires an exact param
+  // name match (not a suffix), so this can't false-positive on e.g. `zip_code=`.
+  /([?&](?:password|passwd|pwd|auth|token|api[_-]?key|access_token|secret|code|id_token|session_id|sid)=)([^&#\s"']+)/gi,
+  // Bare (schemeless) Authorization header value, 16-31 chars — the two-token
+  // pattern above requires `<scheme> <value>` and only matches 32+ chars via
+  // the high-entropy fallback below, leaving a short single-token value (no
+  // "Bearer"/"Basic" prefix) in this length band unredacted.
+  /(authorization:\s*)([A-Za-z0-9._\-+/=]{16,31})(?=\s*(?:\r?\n|$))/gi,
   // HTTP Digest auth: the `response=` field is the credential-derived hash; the
   // 2-token Authorization pattern above only catches `Digest username=...`,
   // leaving the response/nonce exposed (E25).

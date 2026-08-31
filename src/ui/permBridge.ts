@@ -4,6 +4,7 @@
 // promise resolves when that happens.
 
 import type { Decision, Prompter, Request } from '../permission/permission.js';
+import { stripControlSequences } from './toolResultFormat.js';
 
 export interface PermissionRequest extends Request {
   resolve: (d: Decision) => void;
@@ -82,6 +83,8 @@ export class BridgedPrompter implements Prompter {
 
       const wrapped: PermissionRequest = {
         ...req,
+        summary: stripControlSequences(req.summary),
+        detail: stripControlSequences(req.detail),
         resolve: (d: Decision) => {
           signal?.removeEventListener('abort', onAbort);
           // Sensitive requests can opt out of session caching: honor this

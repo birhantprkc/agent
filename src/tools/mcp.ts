@@ -163,6 +163,14 @@ export class MCPTool implements Tool {
     return true;
   }
 
+  // Scope "allow session" to this invocation's args. Without a cacheKey the
+  // permission bridge keys only on tool name — approving one mcp_browser_*
+  // call would auto-allow every later call with arbitrary args for the
+  // session (navigate any URL, evaluate, click, …).
+  permissionHints(args: Record<string, unknown>): { cacheKey: string } {
+    return { cacheKey: stableArgsKey(args) };
+  }
+
   summarize(args: Record<string, unknown>): { summary: string; detail: string } {
     // Tools with a single obvious argument (e.g. the browser tool's `url`)
     // show a friendly label + bare value instead of raw JSON.
@@ -192,6 +200,15 @@ const MCP_MAX_CONTENT_BLOCKS = 200;
 // Cap recursion so a deeply nested (or self-referential-looking) content tree
 // from a hostile/buggy server can't blow the stack before the char cap applies.
 const MCP_MAX_DEPTH = 32;
+
+/** Stable, order-independent cache key for MCP tool args (session allow). */
+function stableArgsKey(args: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(args, Object.keys(args).sort());
+  } catch {
+    return String(args);
+  }
+}
 
 /** Recursively cap string fields and array lengths in MCP content so the
  *  downstream JSON.stringify can't allocate an unbounded string. */

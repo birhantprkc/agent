@@ -7,16 +7,19 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { MemoryStore } from '../curatedMemory/store.js';
 import { IntelligenceStore } from '../intelligence/store.js';
 import type { Client } from '../llm/client.js';
 import type { ChatRequest, ChatResponse } from '../llm/types.js';
-import { MemoryStore } from '../memory/store.js';
+import type { MemoryProvider, MemoryProviderEntry } from '../memoryProvider/types.js';
 import { AlwaysAllow } from '../permission/permission.js';
 import { Store as SessionStore, newID as newSessionID } from '../session/store.js';
 import { Registry as SkillRegistry } from '../skills/registry.js';
 import { Target } from '../target/target.js';
 import { Registry as ToolRegistry } from '../tools/registry.js';
 import type { Tool } from '../tools/types.js';
+import { UpdateUserProfileTool } from '../tools/userProfile.js';
+import { UserProfileStore } from '../userProfile/store.js';
 import { Agent, reconcileToolCalls } from './agent.js';
 import type { AgentEvent } from './events.js';
 
@@ -86,25 +89,6 @@ function makeAgentWithClient(scripted: ChatResponse[]): {
   return { agent, client, tool };
 }
 
-function makeAgentWithSkills(
-  scripted: ChatResponse[],
-  skills: SkillRegistry,
-): {
-  agent: Agent;
-  client: FakeClient;
-} {
-  const client = new FakeClient(scripted);
-  const agent = new Agent({
-    client,
-    tools: new ToolRegistry(),
-    skills,
-    prompter: new AlwaysAllow(),
-    store: null,
-    target: new Target(),
-  });
-  return { agent, client };
-}
-
 function collect(): { events: AgentEvent[]; sink: (e: AgentEvent) => void } {
   const events: AgentEvent[] = [];
   return { events, sink: (e: AgentEvent) => events.push(e) };
@@ -153,6 +137,45 @@ describe('Agent.run', () => {
     expect(types).toContain('tool-result');
     const result = events.find((e) => e.type === 'tool-result');
     expect(result && result.type === 'tool-result' ? result.result : '').toContain('echoed: ping');
+  });
+
+  it('accumulates backend-reported usage across turns and getUsage() returns a fresh copy', async () => {
+    const a = makeAgent([
+      {
+        message: { role: 'assistant', content: 'first' },
+        finishReason: 'stop',
+        usage: { inputTokens: 100, outputTokens: 20, cachedInputTokens: 40 },
+      },
+      {
+        message: { role: 'assistant', content: 'second' },
+        finishReason: 'stop',
+        usage: { inputTokens: 150, outputTokens: 30 },
+      },
+    ]);
+    await a.run('hi', new AbortController().signal, collect().sink);
+    await a.run('hi again', new AbortController().signal, collect().sink);
+
+    expect(a.getUsage()).toEqual({
+      inputTokens: 250,
+      outputTokens: 50,
+      cachedInputTokens: 40,
+      calls: 2,
+    });
+
+    const snapshot = a.getUsage();
+    snapshot.inputTokens = 999;
+    expect(a.getUsage().inputTokens).toBe(250);
+  });
+
+  it('leaves usage totals at zero when the backend reports no usage', async () => {
+    const a = makeAgent([{ message: { role: 'assistant', content: 'hi' }, finishReason: 'stop' }]);
+    await a.run('hi', new AbortController().signal, collect().sink);
+    expect(a.getUsage()).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      calls: 0,
+    });
   });
 
   it('omits tool definitions when tools are disabled for a turn', async () => {
@@ -211,43 +234,6 @@ describe('Agent.run', () => {
     expect(events).toContainEqual({
       type: 'error',
       err: expect.objectContaining({ message: 'plan-only mode blocked tool calls' }),
-    });
-  });
-
-  it('injects decision guidance before the user message for normal turns', async () => {
-    const skills = new SkillRegistry();
-    skills.add({
-      name: 'recon',
-      description: 'External recon playbook for subdomain enumeration',
-      tools: [],
-      disableModelInvocation: false,
-      path: '/tmp/recon/SKILL.md',
-      body: '',
-    });
-    const { agent, client } = makeAgentWithSkills(
-      [
-        {
-          message: { role: 'assistant', content: 'ok' },
-          finishReason: 'stop',
-        },
-      ],
-      skills,
-    );
-    const { events, sink } = collect();
-    await agent.run('enumerate subdomains for example.com', new AbortController().signal, sink);
-
-    expect(events).toContainEqual({
-      type: 'decision',
-      summary: expect.stringContaining('selected skill: recon'),
-    });
-    const messages = client.requests[0]?.messages ?? [];
-    expect(messages.at(-3)).toMatchObject({
-      role: 'system',
-      content: expect.stringContaining('Decision planner guidance'),
-    });
-    expect(messages.at(-2)).toMatchObject({
-      role: 'user',
-      content: 'enumerate subdomains for example.com',
     });
   });
 
@@ -379,36 +365,6 @@ describe('Agent.run', () => {
     }
   });
 
-  it('skips decision guidance for plan-only turns', async () => {
-    const skills = new SkillRegistry();
-    skills.add({
-      name: 'recon',
-      description: 'External recon playbook for subdomain enumeration',
-      tools: [],
-      disableModelInvocation: false,
-      path: '/tmp/recon/SKILL.md',
-      body: '',
-    });
-    const { agent, client } = makeAgentWithSkills(
-      [
-        {
-          message: { role: 'assistant', content: 'plan' },
-          finishReason: 'stop',
-        },
-      ],
-      skills,
-    );
-    const { events, sink } = collect();
-    await agent.run('plan recon for example.com', new AbortController().signal, sink, {
-      tools: false,
-    });
-
-    expect(events.some((e) => e.type === 'decision')).toBe(false);
-    expect(client.requests[0]?.messages.some((m) => m.content.includes('Decision planner'))).toBe(
-      false,
-    );
-  });
-
   it('surfaces a tool failure as a tool-result with err set', async () => {
     const a = makeAgent([
       {
@@ -464,10 +420,12 @@ describe('Agent.run', () => {
     const { events, sink } = collect();
     await agent.run('hi', new AbortController().signal, sink);
     const compactEvents = events.filter((e) => e.type === 'compact');
-    // We expect two compact events: "triggered" + "after" outcome.
-    expect(compactEvents.length).toBeGreaterThanOrEqual(2);
-    const last = compactEvents[compactEvents.length - 1];
-    expect(last && last.type === 'compact' ? last.summary : '').toContain('auto-compacted');
+    // Single quiet success notice (no separate "triggered…" event).
+    expect(compactEvents.length).toBe(1);
+    const only = compactEvents[0];
+    expect(only && only.type === 'compact' ? only.summary : '').toBe('Context compacted');
+    expect(only && only.type === 'compact' ? only.tokensBefore : undefined).toBeTypeOf('number');
+    expect(only && only.type === 'compact' ? only.tokensAfter : undefined).toBeTypeOf('number');
   });
 
   it('stores structured memory after manual compaction', async () => {
@@ -774,6 +732,93 @@ describe('Agent.run', () => {
     // 3 compaction attempts (each made 1 chat call) + 5 turn attempts
     // (each made 1 chat call) = 8.
     expect(flaky.calls).toBe(8);
+  });
+
+  it('surfaces a retry during auto-compact too, not just the main turn', async () => {
+    // autoCompact's compactInPlace() call used to build its ChatRequest
+    // without forwarding onRetry — closing that gap so a rate-limit backoff
+    // mid-compaction is just as visible as one mid-turn.
+    class RetryingClient implements Client {
+      calls = 0;
+      name() {
+        return 'flaky-recovers';
+      }
+      model() {
+        return 'm';
+      }
+      async chat(
+        _req: ChatRequest,
+        _signal?: AbortSignal,
+        onRetry?: (info: { attempt: number; delayMs: number; err: unknown }) => void,
+      ): Promise<ChatResponse> {
+        this.calls += 1;
+        onRetry?.({ attempt: 1, delayMs: 400, err: new Error('rate limited') });
+        return { message: { role: 'assistant', content: 'ok' }, finishReason: 'stop' };
+      }
+    }
+    const client = new RetryingClient();
+    const agent = new Agent({
+      client,
+      tools: new ToolRegistry(),
+      skills: new SkillRegistry(),
+      prompter: new AlwaysAllow(),
+      store: null,
+      target: new Target(),
+      autoCompactThreshold: 1, // forces auto-compact before the turn's own chat call
+      streamingEnabled: false,
+    });
+    // compactInPlace() no-ops when history has nothing to compact yet (just
+    // the system prompt), so the first turn only makes the turn's own chat()
+    // call. The second turn has real history to compact, forcing auto-compact
+    // (threshold 1) — that's the call whose onRetry we're checking reaches
+    // the transcript.
+    await agent.run('hi', new AbortController().signal, collect().sink);
+    const { events, sink } = collect();
+    await agent.run('again', new AbortController().signal, sink);
+    expect(client.calls).toBe(3); // turn 1 + (auto-compact + turn) on turn 2
+    const retries = events.filter((e) => e.type === 'retry');
+    // Both the auto-compact call and turn 2's own call fired onRetry.
+    expect(retries.length).toBe(2);
+  });
+
+  it('surfaces the client onRetry hook as a visible retry event (H — human in the loop)', async () => {
+    // Grok/Claude-Code-style: a backend's own rate-limit backoff shouldn't be
+    // an invisible pause. The client decides whether/how to retry; the agent
+    // only has to forward that hook into a transcript-visible event.
+    class RetryingClient implements Client {
+      name() {
+        return 'flaky-but-recovers';
+      }
+      model() {
+        return 'm';
+      }
+      async chat(
+        _req: ChatRequest,
+        _signal?: AbortSignal,
+        onRetry?: (info: { attempt: number; delayMs: number; err: unknown }) => void,
+      ): Promise<ChatResponse> {
+        onRetry?.({ attempt: 1, delayMs: 750, err: new Error('rate limited') });
+        return { message: { role: 'assistant', content: 'recovered' }, finishReason: 'stop' };
+      }
+    }
+    const a = new Agent({
+      client: new RetryingClient(),
+      tools: new ToolRegistry(),
+      skills: new SkillRegistry(),
+      prompter: new AlwaysAllow(),
+      store: null,
+      target: new Target(),
+      streamingEnabled: false,
+    });
+    const { events, sink } = collect();
+    await a.run('hi', new AbortController().signal, sink);
+    const retry = events.find((e) => e.type === 'retry');
+    expect(retry).toBeDefined();
+    if (retry?.type === 'retry') {
+      expect(retry.attempt).toBe(1);
+      expect(retry.delayMs).toBe(750);
+      expect(retry.message).toContain('rate limited');
+    }
   });
 
   it('emits an error event when a panic escapes', async () => {
@@ -1469,9 +1514,7 @@ describe('Agent mid-turn context guard (M2)', () => {
     await agent.run('go', new AbortController().signal, sink);
 
     // The guard emitted an informational event naming the elision.
-    const guardEvent = events.find(
-      (e) => e.type === 'decision' && e.summary.includes('context guard'),
-    );
+    const guardEvent = events.find((e) => e.type === 'decision' && e.summary.includes('context ·'));
     expect(guardEvent).toBeDefined();
 
     // History keeps every tool result at full fidelity (only the working copy
@@ -1491,8 +1534,9 @@ describe('Agent curated memory', () => {
     const memoryStore = new MemoryStore({ cwd, home });
     const tools = new ToolRegistry();
     tools.register(new EchoTool());
+    const client = new FakeClient(scripted);
     const agent = new Agent({
-      client: new FakeClient(scripted),
+      client,
       tools,
       skills: new SkillRegistry(),
       prompter: new AlwaysAllow(),
@@ -1502,6 +1546,7 @@ describe('Agent curated memory', () => {
     });
     return {
       agent,
+      client,
       memoryStore,
       cleanup: () => {
         rmSync(cwd, { recursive: true, force: true });
@@ -1540,6 +1585,29 @@ describe('Agent curated memory', () => {
     }
   });
 
+  it('folds recalled memory into the single leading system message instead of a second system entry', async () => {
+    // Regression test: some locally-served models' chat templates (Ollama,
+    // LM Studio, vLLM) hard-error with "System message must be at the
+    // beginning" if a role:'system' message appears anywhere but index 0.
+    // Recall used to be spliced in as its own system message right before
+    // the user turn — assert that never happens again, on any backend.
+    const { agent, client, cleanup } = makeMemoryAgent([
+      { message: { role: 'assistant', content: 'ok' }, finishReason: 'stop' },
+    ]);
+    try {
+      await agent.addMemory({ text: 'orders API IDOR via sequential id on /api/orders/{id}' });
+      await agent.run('test the orders endpoint for idor', new AbortController().signal, () => {});
+
+      const req = client.requests.at(-1);
+      const systemMessages = req?.messages.filter((m) => m.role === 'system') ?? [];
+      expect(systemMessages).toHaveLength(1);
+      expect(req?.messages[0]?.role).toBe('system');
+      expect(req?.messages[0]?.content).toContain('orders API IDOR');
+    } finally {
+      cleanup();
+    }
+  });
+
   it('keeps the saved-memory catalog in the prompt after a compaction', async () => {
     // compact() resets history to [system, summary]; the catalog must still be
     // present in the rebuilt system prompt so the model never "forgets" it.
@@ -1571,6 +1639,322 @@ describe('Agent curated memory', () => {
       expect(agent.getHistory()[0]?.content ?? '').not.toContain(name);
     } finally {
       cleanup();
+    }
+  });
+});
+
+describe('Agent user profile', () => {
+  function makeUserProfileAgent(scripted: ChatResponse[]) {
+    const home = mkdtempSync(join(tmpdir(), 'pf-agent-userprofile-home-'));
+    const userProfileStore = new UserProfileStore({ home });
+    const client = new FakeClient(scripted);
+    const agent = new Agent({
+      client,
+      tools: new ToolRegistry(),
+      skills: new SkillRegistry(),
+      prompter: new AlwaysAllow(),
+      store: null,
+      target: new Target(),
+      userProfileStore,
+    });
+    return {
+      agent,
+      client,
+      cleanup: () => rmSync(home, { recursive: true, force: true }),
+    };
+  }
+
+  it('is empty by default and getUserProfile() reflects that', () => {
+    const { agent, cleanup } = makeUserProfileAgent([]);
+    try {
+      expect(agent.getUserProfile()).toBe('');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('addUserProfileNote persists the note and folds it into the system prompt immediately', async () => {
+    const { agent, cleanup } = makeUserProfileAgent([]);
+    try {
+      await agent.addUserProfileNote('prefers terse output');
+      expect(agent.getUserProfile()).toContain('prefers terse output');
+      expect(agent.getHistory()[0]?.content ?? '').toContain('prefers terse output');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('the learned note rides in every subsequent request as a single system message', async () => {
+    const { agent, client, cleanup } = makeUserProfileAgent([
+      { message: { role: 'assistant', content: 'ok' }, finishReason: 'stop' },
+    ]);
+    try {
+      await agent.addUserProfileNote('always wants a curl repro attached');
+      await agent.run('test this endpoint', new AbortController().signal, () => {});
+
+      const req = client.requests.at(-1);
+      const systemMessages = req?.messages.filter((m) => m.role === 'system') ?? [];
+      expect(systemMessages).toHaveLength(1);
+      expect(req?.messages[0]?.content).toContain('always wants a curl repro attached');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('clearUserProfile wipes the note from both disk and the system prompt', async () => {
+    const { agent, cleanup } = makeUserProfileAgent([]);
+    try {
+      await agent.addUserProfileNote('prefers terse output');
+      await agent.clearUserProfile();
+      expect(agent.getUserProfile()).toBe('');
+      expect(agent.getHistory()[0]?.content ?? '').not.toContain('prefers terse output');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('is a no-op when no store is configured', async () => {
+    const agent = makeAgent([]);
+    await expect(agent.addUserProfileNote('anything')).resolves.toBeUndefined();
+    await expect(agent.clearUserProfile()).resolves.toBeUndefined();
+    expect(agent.getUserProfile()).toBe('');
+  });
+});
+
+describe('Agent memory provider', () => {
+  class FakeMemoryProvider implements MemoryProvider {
+    recorded: MemoryProviderEntry[] = [];
+    recallResult = '';
+    statusText = '';
+
+    name(): string {
+      return 'fake-provider';
+    }
+    systemPromptContext(): string {
+      return this.statusText;
+    }
+    async recall(): Promise<string> {
+      return this.recallResult;
+    }
+    async record(entry: MemoryProviderEntry): Promise<void> {
+      this.recorded.push(entry);
+    }
+    tools(): Tool[] {
+      return [];
+    }
+    async close(): Promise<void> {}
+  }
+
+  function makeProviderAgent(scripted: ChatResponse[], provider: MemoryProvider) {
+    const client = new FakeClient(scripted);
+    const agent = new Agent({
+      client,
+      tools: new ToolRegistry(),
+      skills: new SkillRegistry(),
+      prompter: new AlwaysAllow(),
+      store: null,
+      target: new Target(),
+      memoryProvider: provider,
+    });
+    return { agent, client };
+  }
+
+  it('getMemoryProviderName reflects the configured provider, null when none', () => {
+    const withProvider = makeProviderAgent([], new FakeMemoryProvider());
+    expect(withProvider.agent.getMemoryProviderName()).toBe('fake-provider');
+    expect(makeAgent([]).getMemoryProviderName()).toBeNull();
+  });
+
+  it('folds provider status + recall into the single leading system message', async () => {
+    const provider = new FakeMemoryProvider();
+    provider.statusText = '42 past turns indexed.';
+    provider.recallResult = 'Relevant prior turn: found an IDOR on /api/orders/{id}.';
+    const { agent, client } = makeProviderAgent(
+      [{ message: { role: 'assistant', content: 'ok' }, finishReason: 'stop' }],
+      provider,
+    );
+
+    await agent.run('test the orders endpoint', new AbortController().signal, () => {});
+
+    const req = client.requests.at(-1);
+    const systemMessages = req?.messages.filter((m) => m.role === 'system') ?? [];
+    expect(systemMessages).toHaveLength(1);
+    expect(req?.messages[0]?.content).toContain('42 past turns indexed');
+    expect(req?.messages[0]?.content).toContain('found an IDOR');
+  });
+
+  it('records both the user message and the assistant reply for each turn', async () => {
+    const provider = new FakeMemoryProvider();
+    const { agent } = makeProviderAgent(
+      [{ message: { role: 'assistant', content: 'noted' }, finishReason: 'stop' }],
+      provider,
+    );
+
+    await agent.run('remember this endpoint', new AbortController().signal, () => {});
+    // record() calls are fire-and-forget; flush the microtask queue.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(provider.recorded.map((e) => e.role)).toEqual(['user', 'assistant']);
+    expect(provider.recorded[0]?.content).toBe('remember this endpoint');
+    expect(provider.recorded[1]?.content).toBe('noted');
+  });
+
+  it('a provider that throws never breaks the turn', async () => {
+    class ThrowingProvider extends FakeMemoryProvider {
+      async recall(): Promise<string> {
+        throw new Error('provider is down');
+      }
+      async record(): Promise<void> {
+        throw new Error('provider is down');
+      }
+    }
+    const { agent } = makeProviderAgent(
+      [{ message: { role: 'assistant', content: 'ok' }, finishReason: 'stop' }],
+      new ThrowingProvider(),
+    );
+    const { events, sink } = collect();
+    await agent.run('hello', new AbortController().signal, sink);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.at(-1)?.type).toBe('done');
+  });
+});
+
+describe('Agent concurrency guards (compact-during-session races)', () => {
+  // A chat() that never resolves until the test calls `release()` — lets a
+  // test start a turn, assert on state.mutating methods while it's still
+  // in flight (this.running === true), then let it finish cleanly.
+  class PendingClient implements Client {
+    private release?: () => void;
+    // Handles releaseNow() being called before run() has reached its
+    // client.chat() call (no await happens between starting run() and
+    // releaseNow() in some tests) — without this, that release is a
+    // silent no-op and the still-unstarted chat() hangs forever.
+    private releasedEarly = false;
+    readonly response: ChatResponse;
+    constructor(response: ChatResponse) {
+      this.response = response;
+    }
+    name() {
+      return 'pending';
+    }
+    model() {
+      return 'm';
+    }
+    chat(): Promise<ChatResponse> {
+      if (this.releasedEarly) return Promise.resolve(this.response);
+      return new Promise((resolve) => {
+        this.release = () => resolve(this.response);
+      });
+    }
+    releaseNow(): void {
+      if (this.release) {
+        this.release();
+      } else {
+        this.releasedEarly = true;
+      }
+    }
+  }
+
+  function makeGuardAgent(client: Client): Agent {
+    return new Agent({
+      client,
+      tools: new ToolRegistry(),
+      skills: new SkillRegistry(),
+      prompter: new AlwaysAllow(),
+      store: null,
+      target: new Target(),
+    });
+  }
+
+  it('rejects /reset, /target, /memory, /skills mutations while a turn is in flight', async () => {
+    const client = new PendingClient({
+      message: { role: 'assistant', content: 'done' },
+      finishReason: 'stop',
+    });
+    const agent = makeGuardAgent(client);
+    const runPromise = agent.run('hi', new AbortController().signal, () => {});
+    // Turn is now mid-flight (blocked inside client.chat()).
+    expect(agent.isRunning()).toBe(true);
+
+    await expect(agent.reset()).rejects.toThrow(/turn is in flight/);
+    await expect(agent.clearMemory()).rejects.toThrow(/turn is in flight/);
+    await expect(agent.forgetMemory('x')).rejects.toThrow(/turn is in flight/);
+    await expect(agent.addMemory({ text: 'x' })).rejects.toThrow(/turn is in flight/);
+    await expect(agent.clearUserProfile()).rejects.toThrow(/turn is in flight/);
+    await expect(agent.setTargetBaseURL('https://x')).rejects.toThrow(/turn is in flight/);
+    await expect(agent.clearTarget()).rejects.toThrow(/turn is in flight/);
+    await expect(agent.setSkillEnabled('nope', true)).rejects.toThrow(/turn is in flight/);
+
+    client.releaseNow();
+    await runPromise;
+    expect(agent.isRunning()).toBe(false);
+  });
+
+  it('allows the same mutations once the turn has finished', async () => {
+    const client = new PendingClient({
+      message: { role: 'assistant', content: 'done' },
+      finishReason: 'stop',
+    });
+    const agent = makeGuardAgent(client);
+    const runPromise = agent.run('hi', new AbortController().signal, () => {});
+    client.releaseNow();
+    await runPromise;
+    expect(agent.isRunning()).toBe(false);
+
+    // None of these should throw now that the turn is over.
+    await expect(agent.setTargetBaseURL('https://example.com')).resolves.toBeUndefined();
+    await expect(agent.clearTarget()).resolves.toBeUndefined();
+  });
+
+  it('update_user_profile tool call still succeeds mid-turn — addUserProfileNote has no running-guard', async () => {
+    // This is the case a blanket this.running guard would have broken: the
+    // tool's whole reason to exist is writing DURING an active turn, when
+    // this.running is true by definition. Only the /user-add slash-command
+    // path (commands/memory.ts) gets the isRunning check, not the method.
+    const home = mkdtempSync(join(tmpdir(), 'pf-agent-guard-userprofile-'));
+    try {
+      const userProfileStore = new UserProfileStore({ home });
+      const client = new FakeClient([
+        {
+          message: {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: 'update_user_profile',
+                  arguments: JSON.stringify({ note: 'prefers terse output' }),
+                },
+              },
+            ],
+          },
+          finishReason: 'tool_calls',
+        },
+        { message: { role: 'assistant', content: 'noted' }, finishReason: 'stop' },
+      ]);
+      const tools = new ToolRegistry();
+      const agent = new Agent({
+        client,
+        tools,
+        skills: new SkillRegistry(),
+        prompter: new AlwaysAllow(),
+        store: null,
+        target: new Target(),
+        userProfileStore,
+      });
+      tools.register(new UpdateUserProfileTool((text) => agent.addUserProfileNote(text)));
+
+      const { events, sink } = collect();
+      await agent.run('hi', new AbortController().signal, sink);
+
+      const result = events.find((e) => e.type === 'tool-result');
+      expect(result && result.type === 'tool-result' ? result.err : 'MISSING').toBe('');
+      expect(agent.getUserProfile()).toContain('prefers terse output');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

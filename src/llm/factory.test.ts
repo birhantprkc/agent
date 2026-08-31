@@ -75,6 +75,42 @@ describe('newFromConfig', () => {
     expect(() => newFromConfig(cfg)).toThrow(/DEEPSEEK_API_KEY/);
   });
 
+  it('creates a Naraya client with defaults', () => {
+    const cfg = defaultConfig();
+    cfg.backend = 'naraya';
+    cfg.api_key = 'sk-nry-test';
+
+    const client = newFromConfig(cfg);
+
+    expect(client.name()).toBe('naraya');
+    expect(client.model()).toBe('deepseek-v4-flash-naraya');
+  });
+
+  it('requires a Naraya API key', () => {
+    const cfg = defaultConfig();
+    cfg.backend = 'naraya';
+
+    expect(() => newFromConfig(cfg)).toThrow(/NARAYA_API_KEY/);
+  });
+
+  it('creates a Dahl client with defaults', () => {
+    const cfg = defaultConfig();
+    cfg.backend = 'dahl';
+    cfg.api_key = 'dahl-test';
+
+    const client = newFromConfig(cfg);
+
+    expect(client.name()).toBe('dahl');
+    expect(client.model()).toBe('moonshotai/Kimi-K2.6');
+  });
+
+  it('requires a Dahl API key', () => {
+    const cfg = defaultConfig();
+    cfg.backend = 'dahl';
+
+    expect(() => newFromConfig(cfg)).toThrow(/DAHL_API_KEY/);
+  });
+
   it('creates a Gemini client with defaults', () => {
     const cfg = defaultConfig();
     cfg.backend = 'gemini';
@@ -91,5 +127,46 @@ describe('newFromConfig', () => {
     cfg.backend = 'gemini';
 
     expect(() => newFromConfig(cfg)).toThrow(/GEMINI_API_KEY/);
+  });
+
+  it('creates an official OpenAI client with defaults', () => {
+    const cfg = defaultConfig();
+    cfg.backend = 'openai';
+    cfg.api_key = 'sk-openai-test';
+
+    const client = newFromConfig(cfg);
+
+    expect(client.name()).toBe('openai');
+    expect(client.model()).toBe('gpt-4.1');
+  });
+
+  it('requires an OpenAI API key', () => {
+    const cfg = defaultConfig();
+    cfg.backend = 'openai';
+
+    expect(() => newFromConfig(cfg)).toThrow(/OPENAI_API_KEY/);
+  });
+
+  it('creates an Anthropic client with current Claude defaults', () => {
+    const cfg = defaultConfig();
+    cfg.backend = 'anthropic';
+    cfg.api_key = 'sk-ant-test';
+
+    const client = newFromConfig(cfg);
+
+    expect(client.name()).toBe('anthropic');
+    expect(client.model()).toBe('claude-sonnet-5');
+  });
+
+  it('forwards temperature/max_tokens to LM Studio', () => {
+    const cfg = defaultConfig();
+    cfg.backend = 'lmstudio';
+    cfg.model = 'local-model';
+    cfg.temperature = 0.2;
+    cfg.max_tokens = 512;
+
+    const client = newFromConfig(cfg);
+    expect(client.name()).toBe('lmstudio');
+    expect(client.model()).toBe('local-model');
   });
 });

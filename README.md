@@ -24,23 +24,23 @@ control.
 
 ```console
 $ pentesterflow
-╭────────────────────────────────────────────────╮
-│  PentesterFlow                                 │
-│  local agent · tools ready · analyst approved  │
-╰────────────────────────────────────────────────╯
+PF v0.3.0 · ollama · …/engagement
 
 › /target https://app.example.com
   target set to https://app.example.com
 
 › test the orders API for broken access control
-⏺ Skill webvuln
-  ⎿ loaded skill: webvuln
+⏺ Skill webvuln · forked
+  ⎿ forked webvuln · 4 tools
 ⏺ http GET https://app.example.com/api/v1/orders/1043
   ⎿ 200 OK
-⏺ BashTool(curl -s -H "Authorization: Bearer $USER_B" ...)
+⏺ shell · HTTP request
+  $ curl -s -H "Authorization: Bearer $USER_B" ...
   ⎿ cross-account response confirmed
-⏺ Confirmed Finding (high) IDOR on /api/v1/orders/{id}
+★ (high) IDOR on /api/v1/orders/{id}
   ⎿ written to ./findings/idor-orders.md
+
+Ready · qwen3:14b · app.example.com
 ```
 
 ## Overview
@@ -76,7 +76,7 @@ auditability. PentesterFlow addresses those gaps with:
 | Hallucinated findings | `confirm_finding` should be used only after reproduction with request/response evidence. |
 | Long engagements | Saved sessions, compaction, context snapshots, resume recap, and continuous local learning. |
 | Real-world tooling | Shell/Bash, HTTP, Burp bridge, browser capture, MCP, file tools, grep/glob, and custom plugins. |
-| Human oversight | Permission prompts, allow-once/session decisions, and explicit YOLO mode for labs. |
+| Human oversight | Permission tiers (`ask` / `auto-safe` / `yolo`), allow-once/session, plan mode. |
 | Reproducibility | Copy-pasteable commands, Markdown findings, JSON-lines logs, and stable session files. |
 | Large attack surfaces | Coverage tracking, `/next`, skills, captured traffic queries, and learned coverage gaps. |
 
@@ -84,13 +84,13 @@ auditability. PentesterFlow addresses those gaps with:
 
 | Area | What it provides |
 |---|---|
-| Agent loop | Plan, act, observe, verify, report, and learn across scoped tasks. |
-| Model backends | Ollama, LM Studio, Kimi, Groq, Gemini, and OpenAI-compatible APIs. |
-| Tools | Shell/Bash, HTTP, file tools, search, browser capture, Burp ingest, MCP, and finding confirmation. |
-| Skills | Markdown playbooks with methodology, payloads, constraints, and allowed tools. |
-| Memory | Session memory, context snapshots, resume recap, and continuous local intelligence. |
-| Reporting | Confirmed findings saved to `./findings/<slug>.md` with evidence, impact, PoC, and remediation. |
-| UX | Full-width terminal UI, slash commands, compact transcripts, permission modals, and interactive provider/model setup. |
+| Agent loop | Plan, act, observe, verify, report, and learn — with auto-continue and context compact. |
+| Model backends | Ollama, LM Studio, Kimi, Groq, Gemini, Anthropic, and OpenAI-compatible APIs. |
+| Tools | Shell, HTTP, file tools, search, browser capture, Burp ingest, MCP, jobs, findings. |
+| Skills | Markdown playbooks; optional `fork` so large playbooks stay out of parent context. |
+| Memory | Session memory, curated `#` facts, context snapshots, resume recap, local intelligence. |
+| Reporting | Confirmed findings in `./findings/<slug>.md` with evidence, impact, PoC, remediation. |
+| UX | OpenTUI full-width chat, slash commands, permission modals, click-to-expand. |
 
 ## Install
 
@@ -189,6 +189,12 @@ DEEPSEEK_API_KEY=sk-... pentesterflow --backend deepseek --model deepseek-v4-fla
 
 # Gemini
 GEMINI_API_KEY=AIza... pentesterflow --backend gemini --model models/gemini-3.5-flash
+
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-... pentesterflow --backend anthropic --model claude-opus-4-8
+
+# Naraya (multi-vendor OpenAI-compatible router)
+NARAYA_API_KEY=sk-nry-... pentesterflow --backend naraya --model deepseek-v4-flash-naraya
 ```
 
 Notes:
@@ -198,6 +204,44 @@ Notes:
 - LM Studio responses are protected with stop tokens and template-marker
   trimming to avoid repeated `<|user|>` / `<|observation|>` leakage.
 - Gemini picker highlights recommended and cheap-cost models.
+
+## Supported Providers and Models
+
+PentesterFlow talks to any OpenAI-compatible endpoint plus native Gemini and
+Anthropic backends. Use `/provider` to configure interactively, or
+`--backend`/`--model` on the CLI. Hosted model lists are fetched live from each
+provider; the models below are the curated, recommended-first picks.
+
+| Backend | Default base URL | Default model | Recommended models |
+| --- | --- | --- | --- |
+| `ollama` | `http://localhost:11434` | _(installed)_ | any local model (e.g. `qwen2.5-coder:32b`); 14b+ recommended for tool use |
+| `lmstudio` | `http://localhost:1234/v1` | _(loaded)_ | any loaded model (e.g. `zai-org/glm-4.7-flash`) |
+| `openai-compat` | _(required)_ | _(server)_ | whatever the endpoint serves |
+| `kimi` | `https://api.moonshot.ai/v1` | `kimi-k2.6` | `kimi-k2.7-code`, `kimi-k2.6`, `kimi-k2.5`, `moonshot-v1-{8k,32k,128k}` (+ `-vision-preview`) |
+| `groq` | `https://api.groq.com/openai/v1` | `openai/gpt-oss-20b` | `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `meta-llama/llama-4-maverick-17b-128e-instruct`, `meta-llama/llama-4-scout-17b-16e-instruct`, `qwen/qwen3-32b`, `deepseek-r1-distill-llama-70b`, `compound-beta`, `compound-beta-mini` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `openrouter/auto` | `openrouter/auto` (auto-router) + any OpenRouter model |
+| `deepseek` | `https://api.deepseek.com` | `deepseek-v4-flash` | `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-chat`, `deepseek-reasoner` |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta` | `models/gemini-3.5-flash` | `models/gemini-3.5-flash`, `models/gemini-3.1-pro-preview`, `models/gemini-flash-latest`, `models/gemini-3-flash-preview`, `models/gemini-3.1-flash-lite`, `models/gemini-2.5-flash-lite`; cheap: `models/gemini-flash-lite-latest`, `models/gemini-3.1-flash-lite-preview`, `models/gemma-4-26b-a4b-it` |
+| `anthropic` | `https://api.anthropic.com/v1` | `claude-opus-4-8` | `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`, `claude-opus-4-5`, `claude-sonnet-4-5` |
+| `naraya` | `https://router.naraya.ai/v1` | `deepseek-v4-flash-naraya` | `deepseek-v4-flash-naraya`, `qwen3.7-max-naraya`, `minimax-m3`, `claude-sonnet-4.5`, `claude-haiku-4.5`, `glm-5`, `deepseek-3.2`, `mistral-large`, `mistral-medium-3-5` |
+
+Model-specific handling:
+
+- **Kimi** `kimi-k2.7-code` / `kimi-k2.6` / `kimi-k2.5` carry a 256K context
+  window and lock `temperature` to `1`. `k2.7-code` always reasons (thinking is
+  mandatory); `k2.6` / `k2.5` expose a thinking toggle.
+- **DeepSeek** `deepseek-chat` / `deepseek-reasoner` are compatibility aliases
+  for `deepseek-v4-flash` (non-thinking / thinking) and are slated for
+  deprecation on 2026-07-24 — prefer the `deepseek-v4-*` ids.
+- **Anthropic** Opus 4.7 / 4.8 reject the `temperature` parameter; older Claude
+  models still accept it.
+- **Naraya** is a multi-vendor router (DeepSeek, Qwen, GLM, Mistral, MiniMax,
+  Claude) behind one OpenAI-compatible endpoint. Inference is served from
+  `router.naraya.ai` and naraya's own model ids carry a `-naraya` suffix where
+  they differ from upstream (e.g. `deepseek-v4-flash-naraya`); the full catalog
+  is fetched live via `/provider`. Several models expose a 1M-token context.
+- **Hosted size guidance**: sub-70b hosted models may be unreliable for agentic
+  tool calls; 70b+ (or a frontier MoE) is recommended.
 
 ## Pentest Lifecycle
 
@@ -351,21 +395,24 @@ binary exposes the same capture data as an MCP server for compatible clients.
 | `/help` | Show keybindings and command reference. |
 | `/provider` | Pick backend, API key, and model interactively. |
 | `/model <id>` / `/model list` | Switch or list backend models. |
+| `/mode ask\|auto-safe\|yolo\|plan\|act` | Permission tier or plan/act work mode. |
 | `/plan [objective]` | Plan-only turn without tool execution. |
 | `/next [objective]` | Coverage-driven next test suggestions. |
 | `/target <url>` | Set or clear the engagement base URL. |
+| `/scope …` | Engagement host allowlist for http/web_fetch. |
 | `/compact` | Summarize into persistent session memory. |
-| `/memory` | Show current persistent session memory. |
+| `/memory` | Saved facts, session memory, provider status. |
+| `/jobs` | List background shell jobs. |
 | `/snapshot` | Write a redacted context snapshot now. |
-| `/burp [port]` | Start the local Burp/PentesterFlow bridge and print its URL + token. |
+| `/report [markdown\|sarif]` | Export all confirmed findings. |
+| `/burp [port]` | Start the local Burp/PentesterFlow bridge. |
 | `/skills [enable\|disable\|new <name>]` | Manage or scaffold skills. |
-| `/maxsteps <n>` | Set the per-turn tool-call cap. |
+| `/maxsteps <n>` | Tool budget before quiet auto-continue (default 20). |
 | `/thinking on\|off` | Toggle visible reasoning guidance. |
 | `/update [version]` | Install the latest or pinned release. |
-| `/yolo [on\|off]` | Toggle auto-approval mode for labs. |
+| `/yolo [on\|off]` | Toggle YOLO auto-approve (lab only). |
 | `/reset` | Clear conversation and saved session state. |
 | `/clear` | Clear only the on-screen transcript. |
-| `/<skill-name>` | Load a skill into the next turn. |
 | `/exit` | Quit. |
 
 ## Command-Line Flags
@@ -392,16 +439,19 @@ binary exposes the same capture data as an MCP server for compatible clients.
 
 | Tool | Purpose |
 |---|---|
-| `shell` / `BashTool` | Run shell commands with approval and safety checks. |
-| `http` | Send HTTP/HTTPS requests against full URLs or active `/target`. |
+| `shell` / `bash` | Run shell commands (optional `background: true` for long jobs). |
+| `http` | HTTP/HTTPS against full URLs or active `/target`. |
 | `file_read` / `file_write` / `file_edit` | Read, create, and patch files. |
-| `GlobTool` / `GrepTool` | Discover files and search content. |
+| `glob` / `grep` | Discover files and search content. |
 | `web_fetch` / `web_search` | Fetch pages or run web searches. |
 | `ask_user` | Ask for a decision when scope or direction is ambiguous. |
 | `confirm_finding` | Save verified findings to `./findings/<slug>.md`. |
 | `coverage` | Track tested endpoint/parameter/vulnerability-class tuples. |
-| `load_skill` | Load methodology playbooks into context. |
-| `browser_capture_*` | Query captured browser/Burp traffic, endpoints, requests, issues, and snapshots. |
+| `todo` | Live checklist for the engagement plan. |
+| `load_skill` | Load playbooks (`fork=true` runs them in a child agent). |
+| `delegate_task` | Spawn a short worker/explore sub-agent and return a summary. |
+| `background_status` | List / get / kill background shell jobs. |
+| `browser_capture_*` | Query captured browser/Burp traffic and snapshots. |
 
 ## Skills
 
@@ -451,7 +501,8 @@ Reports include:
 
 - **Authorized use only**: built for permitted security work.
 - **Human-in-the-loop by default**: permission-gated tools require allow once,
-  allow session, or deny.
+  allow session, or deny. Use `/mode auto-safe` for read-only auto-approve, or
+  `/yolo` only in labs.
 - **Sensitive path protection**: high-risk local paths remain gated.
 - **Shell safeguards**: catastrophic command patterns are blocked before
   execution.
@@ -461,6 +512,22 @@ Reports include:
   and observed responses.
 - **Auditability**: sessions, logs, findings, coverage, and release artifacts are
   written to deterministic local paths.
+
+### Keyboard (OpenTUI)
+
+| Key | Action |
+|---|---|
+| Enter | Send prompt |
+| Esc | Cancel in-flight turn / clear draft |
+| Ctrl+O | Expand truncated tool output |
+| Cmd+C / Ctrl+Y | Copy selection or last tool/finding output (`pbcopy` on macOS) |
+| Cmd+V / Ctrl+V | Paste (`pbpaste` + bracketed paste) |
+| PgUp / PgDn / wheel | Scroll chat history |
+| Tab | Complete slash command or `@` file mention |
+
+> **macOS Terminal.app:** drag-select text in the app, then **Cmd+C** (or wait for
+> auto-copy on mouse-up). **Cmd+V** pastes into the prompt. Apple Terminal ignores
+> OSC 52 clipboard escapes — PentesterFlow uses `pbcopy`/`pbpaste` instead.
 
 ## Configuration And Data
 

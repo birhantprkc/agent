@@ -19,8 +19,8 @@ import {
   ANTHROPIC_VERSION,
   anthropicAcceptsTemperature,
 } from './providers.js';
-import { withRetry } from './retry.js';
-import type { ChatRequest, ChatResponse, FinishReason, Message, ToolSpec } from './types.js';
+import { type RetryInfo, withRetry } from './retry.js';
+import type { ChatRequest, ChatResponse, FinishReason, Message, ToolSpec, Usage } from './types.js';
 
 /** Annotate a backend error with the server's Retry-After so withRetry can
  *  honor it instead of its computed backoff. */
@@ -45,6 +45,11 @@ interface AnthropicResponse {
   }>;
   stop_reason?: string;
   error?: { message?: string };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
 }
 
 const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -86,15 +91,21 @@ export class AnthropicClient implements Client, Pinger {
       },
       signal,
     });
-    if (resp.status >= 500) {
+    // Any non-2xx means disconnected — see openai.ts ping() for why 4xx
+    // must fail too, not just 5xx.
+    if (resp.status < 200 || resp.status >= 300) {
       throw new Error(`anthropic status ${resp.status}`);
     }
   }
 
-  async chat(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
+  async chat(
+    req: ChatRequest,
+    signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
+  ): Promise<ChatResponse> {
     // Retry rate limits / transient 5xx with backoff. The call has no
     // observable side effects before it returns, so re-running it is safe.
-    return withRetry(() => this.chatOnce(req, signal), { signal });
+    return withRetry(() => this.chatOnce(req, signal), { signal, onRetry });
   }
 
   private async chatOnce(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
@@ -158,11 +169,24 @@ export class AnthropicClient implements Client, Pinger {
           },
         }));
       }
-      return { message: msg, finishReason: mapFinishReason(out.stop_reason) };
+      return {
+        message: msg,
+        finishReason: mapFinishReason(out.stop_reason),
+        usage: toUsage(out.usage),
+      };
     } finally {
       dispose();
     }
   }
+}
+
+function toUsage(u: AnthropicResponse['usage']): Usage | undefined {
+  if (!u) return undefined;
+  return {
+    inputTokens: u.input_tokens ?? 0,
+    outputTokens: u.output_tokens ?? 0,
+    cachedInputTokens: u.cache_read_input_tokens,
+  };
 }
 
 /** Map Anthropic's stop_reason onto the project's FinishReason. Unknown values
@@ -215,12 +239,14 @@ function encodeRequest(
     .filter((m) => m.role === 'system')
     .map((m) => m.content)
     .join('\n\n');
-  const messages = req.messages
-    .filter((m) => m.role !== 'system')
-    .map(encodeMessage)
-    // A turn can encode to nothing (e.g. an empty assistant message); drop it
-    // so we don't send a content-less block the API would reject.
-    .filter((m): m is { role: 'user' | 'assistant'; content: ContentBlock[] } => m !== null);
+  const messages = mergeAdjacentSameRole(
+    req.messages
+      .filter((m) => m.role !== 'system')
+      .map(encodeMessage)
+      // A turn can encode to nothing (e.g. an empty assistant message); drop it
+      // so we don't send a content-less block the API would reject.
+      .filter((m): m is { role: 'user' | 'assistant'; content: ContentBlock[] } => m !== null),
+  );
 
   const body: Record<string, unknown> = {
     model,
@@ -229,14 +255,50 @@ function encodeRequest(
       genOpts.maxTokens && genOpts.maxTokens > 0 ? genOpts.maxTokens : ANTHROPIC_DEFAULT_MAX_TOKENS,
     messages,
   };
-  if (systemText) body.system = systemText;
-  if (req.tools?.length) body.tools = req.tools.map(encodeTool);
+  // Mark the system prompt and the tool catalog as cacheable prefixes: both
+  // are large (the system prompt alone can run tens of KB with skills
+  // loaded) and near-identical on every request within a session, so
+  // caching them turns most of the request into a cache read instead of
+  // billed input tokens on every turn.
+  if (systemText) {
+    body.system = [{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }];
+  }
+  if (req.tools?.length) {
+    const tools = req.tools.map(encodeTool);
+    tools[tools.length - 1] = {
+      ...tools[tools.length - 1],
+      cache_control: { type: 'ephemeral' },
+    };
+    body.tools = tools;
+  }
   // Only send temperature to models that accept it — opus-4-7/4-8 (and the
   // Fable/Mythos 5 family) 400 on any sampling parameter.
   if (genOpts.temperature !== undefined && anthropicAcceptsTemperature(model)) {
     body.temperature = genOpts.temperature;
   }
   return body;
+}
+
+// Anthropic requires every tool_use id from an assistant turn to be answered
+// by tool_result blocks in a single following user message. Parallel tool
+// execution (agent.ts executeToolCalls) records one 'tool' Message per call,
+// which encodeMessage each turns into its own user message — left unmerged,
+// any turn with 2+ concurrent tool calls sends N consecutive user messages
+// and the API 400s. Collapse adjacent same-role messages into one, in order,
+// so all of a turn's tool_result blocks land in a single user message.
+function mergeAdjacentSameRole(
+  messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[] }>,
+): Array<{ role: 'user' | 'assistant'; content: ContentBlock[] }> {
+  const out: Array<{ role: 'user' | 'assistant'; content: ContentBlock[] }> = [];
+  for (const m of messages) {
+    const last = out[out.length - 1];
+    if (last && last.role === m.role) {
+      last.content = [...last.content, ...m.content];
+    } else {
+      out.push({ role: m.role, content: [...m.content] });
+    }
+  }
+  return out;
 }
 
 function encodeMessage(m: Message): { role: 'user' | 'assistant'; content: ContentBlock[] } | null {

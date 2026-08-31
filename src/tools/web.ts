@@ -3,7 +3,9 @@
 // parses the top results.
 
 import type { Prompter } from '../permission/permission.js';
+import type { ScopeStore } from '../target/scope.js';
 import { gatePrivateRequest, parseHTTPURL } from './privateHost.js';
+import { gateOutOfScope } from './scopeGate.js';
 import { type Tool, argString } from './types.js';
 
 const FETCH_TIMEOUT_MS = 30 * 1000;
@@ -78,6 +80,12 @@ function stripHTML(s: string): string {
 }
 
 export class WebFetchTool implements Tool {
+  private readonly scope?: ScopeStore;
+
+  constructor(scope?: ScopeStore) {
+    this.scope = scope;
+  }
+
   name(): string {
     return 'web_fetch';
   }
@@ -102,9 +110,10 @@ export class WebFetchTool implements Tool {
     if (!url) throw new Error('url is required');
     const parsed = parseHTTPURL(url);
     const privateReason = await gatePrivateRequest(p, parsed, signal, 'web_fetch');
+    const scopeReason = await gateOutOfScope(p, parsed, signal, 'web_fetch', this.scope);
 
-    // Cache-check after the private-host gate so a repeat private fetch still
-    // re-prompts rather than silently replaying a cached body.
+    // Cache-check after the private-host/scope gates so a repeat gated fetch
+    // still re-prompts rather than silently replaying a cached body.
     const cacheKey = `fetch:${parsed.toString()}`;
     const cached = cacheGet(cacheKey);
     if (cached !== undefined) return cached;
@@ -136,6 +145,9 @@ export class WebFetchTool implements Tool {
     let result = `URL: ${url}\nStatus: ${resp.status} ${resp.statusText}\n\n${text}`;
     if (privateReason) {
       result = `note: private/internal host approved for this fetch (reason: ${privateReason})\n\n${result}`;
+    }
+    if (scopeReason) {
+      result = `note: out-of-scope host approved for this fetch (reason: ${scopeReason})\n\n${result}`;
     }
     cacheSet(cacheKey, result);
     return result;

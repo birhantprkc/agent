@@ -41,8 +41,18 @@ beforeAll(async () => {
         res.write(
           event({ candidates: [{ content: { parts: [{ text: 'pondering', thought: true }] } }] }),
         );
-        res.write(event({ candidates: [{ content: { parts: [{ text: 'wor' }] } }] }));
-        res.write(event({ candidates: [{ content: { parts: [{ text: 'king' }] } }] }));
+        res.write(
+          event({
+            candidates: [{ content: { parts: [{ text: 'wor' }] } }],
+            usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 1 },
+          }),
+        );
+        res.write(
+          event({
+            candidates: [{ content: { parts: [{ text: 'king' }] } }],
+            usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 2 },
+          }),
+        );
         res.write(
           event({
             candidates: [
@@ -58,6 +68,8 @@ beforeAll(async () => {
                 finishReason: 'STOP',
               },
             ],
+            // Final cumulative tally — the one the client should keep.
+            usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 3 },
           }),
         );
         res.end();
@@ -80,6 +92,11 @@ beforeAll(async () => {
               finishReason: 'STOP',
             },
           ],
+          usageMetadata: {
+            promptTokenCount: 120,
+            candidatesTokenCount: 15,
+            cachedContentTokenCount: 30,
+          },
         }),
       );
     });
@@ -152,6 +169,7 @@ describe('GeminiClient', () => {
       properties: { url: { type: 'STRING' } },
       required: ['url'],
     });
+    expect(out.usage).toEqual({ inputTokens: 120, outputTokens: 15, cachedInputTokens: 30 });
   });
 
   it('emits generationConfig from threaded temperature/max_tokens', async () => {
@@ -197,6 +215,9 @@ describe('GeminiClient', () => {
     expect(out.message.toolCalls?.[0]?.function.name).toBe('http');
     expect(out.message.toolCalls?.[0]?.function.arguments).toBe('{"url":"https://example.com"}');
     expect(out.message.toolCalls?.[0]?.provider?.gemini?.thoughtSignature).toBe('sig-http');
+    // usageMetadata rides on every chunk cumulatively — the client must keep
+    // the LAST one, not sum across chunks or keep the first.
+    expect(out.usage).toEqual({ inputTokens: 50, outputTokens: 3, cachedInputTokens: undefined });
   });
 
   it('pings the model list endpoint', async () => {

@@ -82,12 +82,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: '20'
-          cache: npm
-      - run: npm ci
-      - run: npm run ci # typecheck -> lint -> test -> build
+          bun-version: latest
+      - run: bun install
+      - run: bun run ci # typecheck -> lint -> test -> build
 
   # One artifact per OS/arch. Bun cross-compiles every target from a single
   # Linux host, so the whole matrix runs without macOS/Windows runners.
@@ -108,14 +107,10 @@ jobs:
           - { target: bun-windows-x64-baseline, name: pentesterflow-windows-x64.exe }
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-      - run: npm ci
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      - run: bun install
       - name: Stamp version into the binary
         run: |
           RELEASE_TAG="${{ needs.prepare.outputs.release_tag }}"

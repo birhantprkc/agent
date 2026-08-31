@@ -53,20 +53,18 @@ export function renderMarkdown(s: string): string {
     // honor that — many models emit ` ```python` (one space) when the
     // block sits after a colon or inside a list, and a strict
     // startsWith('```') silently dropped those.
-    const fenceMatch = raw.match(/^[ \t]{0,3}```\s*(\S*)/);
+    // Fence info string: language token only (stop at space/{/: so
+    // ```js title="x" or ```python{1} still resolve to js/python).
+    const fenceMatch = raw.match(/^[ \t]{0,3}```\s*([^\s{]*)/);
     if (fenceMatch) {
       if (inFence) {
-        // Closing fence — flush buffered content. renderFencedBlock
-        // now returns the WHOLE block (header rule + gutter body +
-        // footer rule), so we don't push our own ``` markers.
+        // Closing fence — flush buffered content with gutter + highlight.
         out.push(renderFencedBlock(fenceBuf, fenceLang));
         inFence = false;
         fenceLang = '';
         fenceBuf = [];
       } else {
         // Opening fence — record language, don't emit anything yet.
-        // The header rule is drawn by renderFencedBlock once we know
-        // the body width.
         inFence = true;
         fenceLang = fenceMatch[1] ?? '';
       }
@@ -141,9 +139,53 @@ function trimOuterBlankLines(lines: string[]): string[] {
  * The `│` glyph on every row IS the visual separation from prose —
  * no extra horizontal rule needed.
  */
-function renderFencedBlock(lines: string[], lang: string): string {
+/** Common fence-language aliases → highlight.js ids. Models often emit
+ *  `js` / `py` / `sh` / `ts` rather than the full language name. */
+const LANG_ALIASES: Record<string, string> = {
+  js: 'javascript',
+  jsx: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  py: 'python',
+  sh: 'bash',
+  shell: 'bash',
+  zsh: 'bash',
+  yml: 'yaml',
+  rb: 'ruby',
+  rs: 'rust',
+  go: 'go',
+  golang: 'go',
+  cs: 'csharp',
+  'c#': 'csharp',
+  'c++': 'cpp',
+  cc: 'cpp',
+  hpp: 'cpp',
+  h: 'c',
+  md: 'markdown',
+  ps1: 'powershell',
+  pwsh: 'powershell',
+  dockerfile: 'docker',
+  tf: 'terraform',
+  hcl: 'terraform',
+};
+
+/** Normalize a fence info string (`js`, `python title=x`, `bash{1}`) to a
+ *  highlight.js language id, or '' when unknown/empty (dim fallback). */
+export function resolveFenceLang(raw: string): string {
+  const token = (raw.trim().split(/[\s{:]+/)[0] ?? '').toLowerCase();
+  if (!token) return '';
+  const resolved = LANG_ALIASES[token] ?? token;
+  if (supportsLanguage(resolved)) return resolved;
+  if (supportsLanguage(token)) return token;
+  return '';
+}
+
+function renderFencedBlock(lines: string[], langRaw: string): string {
   if (lines.length === 0) return '';
 
+  const lang = resolveFenceLang(langRaw);
   let highlighted: string[];
   if (lang && supportsLanguage(lang)) {
     try {
@@ -157,6 +199,8 @@ function renderFencedBlock(lines: string[], lang: string): string {
       highlighted = lines.map((l) => chalk.dim(l));
     }
   } else {
+    // Unknown / empty language: still dim so the block reads as code,
+    // distinct from surrounding prose.
     highlighted = lines.map((l) => chalk.dim(l));
   }
 
@@ -164,6 +208,7 @@ function renderFencedBlock(lines: string[], lang: string): string {
   return highlighted
     .map((row, i) => {
       const num = String(i + 1).padStart(gutterWidth, ' ');
+      // Gutter is always dim; body keeps highlighter colors (or dim plain).
       return `${chalk.dim(`${num}│`)} ${row}`;
     })
     .join('\n');

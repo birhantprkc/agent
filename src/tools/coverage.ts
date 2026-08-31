@@ -177,9 +177,12 @@ export class CoverageTool implements Tool {
       : [];
     const vulnClasses = Array.isArray(args.vuln_classes) ? (args.vuln_classes as unknown[]) : [];
     const candPairs = candidates
+      // A malformed call like candidates:[null] used to throw an uncaught
+      // TypeError from property access instead of just filtering it out.
       .map((c) => ({
-        endpoint: typeof c.endpoint === 'string' ? c.endpoint : '',
-        param: typeof c.param === 'string' ? c.param : '',
+        endpoint:
+          typeof c === 'object' && c !== null && typeof c.endpoint === 'string' ? c.endpoint : '',
+        param: typeof c === 'object' && c !== null && typeof c.param === 'string' ? c.param : '',
       }))
       .filter((c) => c.endpoint && c.param);
     const classes = vulnClasses.filter((v): v is string => typeof v === 'string' && v.length > 0);

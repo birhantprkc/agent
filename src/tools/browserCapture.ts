@@ -188,7 +188,14 @@ export class BrowserCaptureGetTool extends BaseCaptureTool {
     if (!id) return 'error: id is required';
     const r = this.store.getRequest(id);
     if (!r) return `error: no request with id ${id}`;
-    const cap = argNumber(args, 'body_max_chars') ?? 4000;
+    // Clamped like every other numeric arg in this file, and the final
+    // output still goes through capJSON below — a captured response with a
+    // multi-MB body (a JS bundle, a proxied file download) plus a large or
+    // omitted body_max_chars must not dump the full blob into model context.
+    const cap = Math.min(
+      Math.max(1, Math.floor(argNumber(args, 'body_max_chars') ?? 4000)),
+      OUTPUT_CHAR_CAP,
+    );
     const trimmed = {
       ...r,
       responseBody:
@@ -197,7 +204,7 @@ export class BrowserCaptureGetTool extends BaseCaptureTool {
           : r.responseBody,
       receivedAt: new Date(r.receivedAt).toISOString(),
     };
-    return JSON.stringify(trimmed, null, 2);
+    return capJSON(trimmed);
   }
 }
 

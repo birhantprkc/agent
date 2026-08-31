@@ -10,11 +10,11 @@
 // same key updates in place rather than appending — this is a coverage
 // matrix, not a log.
 
-import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
-import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { warn } from '../logger/logger.js';
+import { atomicWriteFile } from '../persist/atomicFile.js';
 
 // Upper bound on persisted coverage entries so a long session enumerating
 // many endpoints can't grow the matrix without limit. Oldest-by-lastSeen
@@ -230,18 +230,7 @@ export class CoverageStore {
     const dir = dirname(this.path);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const payload: PersistShape = { version: 1, entries: [...this.entries.values()] };
-    const tmp = `${this.path}.tmp.${randomBytes(3).toString('hex')}`;
-    try {
-      await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, {
-        encoding: 'utf8',
-        mode: 0o600,
-      });
-      await rename(tmp, this.path);
-      await chmod(this.path, 0o600).catch(() => undefined);
-    } catch (err) {
-      await unlink(tmp).catch(() => undefined);
-      throw err;
-    }
+    await atomicWriteFile(this.path, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
   }
 }
 

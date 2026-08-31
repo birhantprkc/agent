@@ -6,6 +6,16 @@
 
 import { BackendError, isTransient } from './errors.js';
 
+/** One retry attempt's info, handed to `onRetry` before the backoff wait
+ *  starts. Shared with Client.chat()/chatStream() so a caller (the agent
+ *  loop) can surface "retrying…" to the user instead of the wait being
+ *  invisible — see agent.ts's `chat()` for the human-in-the-loop wiring. */
+export interface RetryInfo {
+  attempt: number;
+  delayMs: number;
+  err: unknown;
+}
+
 export interface RetryOptions {
   /** Max additional attempts after the first try (default 2 → up to 3 calls). */
   retries?: number;
@@ -18,7 +28,7 @@ export interface RetryOptions {
   /** Cancels pending waits and stops further attempts. */
   signal?: AbortSignal;
   /** Observability hook fired before each retry wait. */
-  onRetry?: (info: { attempt: number; delayMs: number; err: unknown }) => void;
+  onRetry?: (info: RetryInfo) => void;
 }
 
 /** Ceiling for server-advised Retry-After waits. A misbehaving proxy can echo

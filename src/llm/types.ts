@@ -54,9 +54,22 @@ export interface ChatRequest {
  */
 export type FinishReason = 'stop' | 'length' | 'tool_calls' | (string & {});
 
+/** Token accounting for one chat() / chatStream() call, as reported by the
+ *  backend. Only populated when the backend's response actually carries
+ *  usage data — never estimated, so callers can trust it for cost/spend
+ *  tracking instead of guessing from string length. */
+export interface Usage {
+  inputTokens: number;
+  outputTokens: number;
+  /** Input tokens served from a provider-side prompt cache (e.g. Anthropic's
+   *  cache_read_input_tokens), when the backend reports the split. */
+  cachedInputTokens?: number;
+}
+
 export interface ChatResponse {
   message: Message;
   finishReason: FinishReason;
+  usage?: Usage;
 }
 
 /**

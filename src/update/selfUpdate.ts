@@ -18,6 +18,17 @@ export interface UpdateResult {
 
 export async function runSelfUpdate(version = 'latest'): Promise<UpdateResult> {
   const repo = process.env.PENTESTERFLOW_REPO || DEFAULT_REPO;
+  assertRepoFormat(repo);
+  if (repo !== DEFAULT_REPO) {
+    // PENTESTERFLOW_REPO is trusted for forking/testing, but raw.githubusercontent.com
+    // serves any public repo — pinning the host alone doesn't stop an env var set by
+    // a poisoned shell profile or shared CI runner from pointing /update at a
+    // different, attacker-controlled repo. Surface the override loudly rather than
+    // silently fetching-and-executing from wherever the environment says to.
+    process.stderr.write(
+      `warning: PENTESTERFLOW_REPO overrides the update source to "${repo}" (default: ${DEFAULT_REPO}) — the installer script will be fetched and executed from this repo.\n`,
+    );
+  }
   const normalizedVersion = normalizeVersion(version);
   const installDir = detectInstallDir();
   const env = {
@@ -45,6 +56,14 @@ export async function runSelfUpdate(version = 'latest'): Promise<UpdateResult> {
     installDir,
     output: compactOutput(output),
   };
+}
+
+/** owner/repo only — no extra path segments, credentials, or query/fragment
+ *  tricks that could change what raw.githubusercontent.com/${repo}/... resolves to. */
+function assertRepoFormat(repo: string): void {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    throw new Error(`invalid PENTESTERFLOW_REPO: ${repo}`);
+  }
 }
 
 function normalizeVersion(raw: string): string {
@@ -89,6 +108,11 @@ async function runWindowsInstaller(
   env: NodeJS.ProcessEnv,
 ): Promise<string> {
   const scriptURL = `https://raw.githubusercontent.com/${repo}/${ref}/install.ps1`;
+  // Unlike the Unix path (fetchText -> assertInstallerURL), this used to build
+  // the iex command straight from scriptURL with no scheme/host check at all —
+  // the one guard that exists in this file wasn't actually wired into the
+  // Windows execution path.
+  assertInstallerURL(scriptURL);
   const command = [
     '$ErrorActionPreference = "Stop"',
     '$ProgressPreference = "SilentlyContinue"',

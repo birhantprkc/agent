@@ -88,6 +88,16 @@ beforeAll(async () => {
           res.end();
           return;
         }
+        if (body.model === 'usage-stream') {
+          send({ choices: [{ delta: { content: 'done' } }] });
+          send({ choices: [{ delta: {}, finish_reason: 'stop' }] });
+          // Terminal usage-only chunk: empty choices, per the OpenAI spec for
+          // stream_options.include_usage.
+          send({ choices: [], usage: { prompt_tokens: 42, completion_tokens: 7 } });
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
         send({ choices: [{ delta: { content: 'Working' } }] });
         send({ choices: [{ delta: { content: ' on it' } }] });
         send({
@@ -172,6 +182,40 @@ beforeAll(async () => {
         );
         return;
       }
+      if (body.model === 'openai-content-tool') {
+        // Simulates openai-compat backend + model that puts the tool call as JSON in content
+        // (common with smaller/uncensored Qwen variants etc.)
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content: JSON.stringify({
+                    name: 'http',
+                    arguments: { url: 'https://example.com/api' },
+                  }),
+                },
+                finish_reason: 'stop',
+              },
+            ],
+          }),
+        );
+        return;
+      }
+      if (body.model === 'usage-nonstream') {
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+            usage: {
+              prompt_tokens: 100,
+              completion_tokens: 20,
+              prompt_tokens_details: { cached_tokens: 64 },
+            },
+          }),
+        );
+        return;
+      }
       res.end(
         JSON.stringify({
           choices: [
@@ -200,6 +244,46 @@ describe('OpenAIClient', () => {
     const out = await c.chat(req);
     expect(out.message.content).toBe('hi');
     expect(out.finishReason).toBe('stop');
+  });
+
+  it('non-streaming chat maps usage, including a cached-token split when the backend reports one', async () => {
+    const c = new OpenAIClient(baseURL, '', 'usage-nonstream');
+    const out = await c.chat({
+      model: 'usage-nonstream',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(out.usage).toEqual({ inputTokens: 100, outputTokens: 20, cachedInputTokens: 64 });
+  });
+
+  it('streaming chat captures usage from the terminal empty-choices chunk', async () => {
+    lastBody = null;
+    const c = new OpenAIClient(baseURL, '', 'usage-stream');
+    const out = await c.chatStream(
+      { model: 'usage-stream', messages: [{ role: 'user', content: 'hi' }] },
+      () => undefined,
+    );
+    expect(lastBody?.stream_options).toEqual({ include_usage: true });
+    expect(out.usage).toEqual({ inputTokens: 42, outputTokens: 7, cachedInputTokens: undefined });
+  });
+
+  it('non-streaming falls back to parsing tool call from content JSON (openai-compat small/uncensored models)', async () => {
+    const c = new OpenAIClient(baseURL, '', 'openai-content-tool');
+    const req: ChatRequest = {
+      model: 'openai-content-tool',
+      messages: [{ role: 'user', content: 'test http' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'http', description: 'http tool', parameters: { type: 'object' } },
+        },
+      ],
+    };
+    const out = await c.chat(req);
+    expect(out.message.toolCalls?.length).toBe(1);
+    expect(out.message.toolCalls?.[0].function.name).toBe('http');
+    expect(out.message.toolCalls?.[0].function.arguments).toContain('example.com');
+    // Content should be cleared when we successfully parsed a tool call from it
+    expect(out.message.content).toBe('');
   });
 
   it('streams reasoning_content as visible deltas but excludes it from the message', async () => {

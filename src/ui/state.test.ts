@@ -4,7 +4,7 @@
 //   - escaped \n / \t inside the JSON don't bleed through
 
 import { describe, expect, it } from 'vitest';
-import { initialState, reducer } from './state.js';
+import { collapseAssistantProse, formatCompactEvent, initialState, reducer } from './state.js';
 
 const ESC = String.fromCharCode(0x1b);
 const stripAnsi = (s: string) => s.replace(new RegExp(`${ESC}\\[[0-9;]*m`, 'g'), '');
@@ -47,7 +47,7 @@ describe('state.reducer tool-call preview', () => {
     expect(last?.text).toMatch(/…$/);
   });
 
-  it('shows the bare command, not the JSON envelope', () => {
+  it('shows Grok-style Shell · title + $ command, not the JSON envelope', () => {
     const out = reducer(seed(), {
       type: 'agent-event',
       event: {
@@ -59,12 +59,12 @@ describe('state.reducer tool-call preview', () => {
       },
     });
     const last = out.transcript.at(-1);
-    expect(last?.text).toBe('Shell(curl -ksS https://example.com)');
+    expect(last?.text).toBe(['Shell · HTTP request', '$ curl -ksS https://example.com'].join('\n'));
     expect(last?.prefix).toBe('⏺ ');
     expect(last?.text).not.toContain('{"command"');
   });
 
-  it('renders BashTool calls in compact Bash(command) style', () => {
+  it('renders short BashTool calls with title + $ line', () => {
     const out = reducer(seed(), {
       type: 'agent-event',
       event: {
@@ -76,8 +76,29 @@ describe('state.reducer tool-call preview', () => {
       },
     });
     const last = out.transcript.at(-1);
-    expect(last?.text).toBe('Bash(mkdir -p recon/gobus.net)');
+    expect(last?.text).toBe(['Bash · Create directory', '$ mkdir -p recon/gobus.net'].join('\n'));
     expect(last?.prefix).toBe('⏺ ');
+  });
+
+  it('renders echo one-liners as Shell · Print text with truncated $ command', () => {
+    const command =
+      'echo "<?php system(\'id\'); ?>" > /tmp/test.php && curl -sS -X POST "https://ptl-example.libcurl.so/" -F "file=@/tmp/test.php"';
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: 'c1',
+        name: 'shell',
+        args: {},
+        argsJSON: JSON.stringify({ command }),
+      },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.text.startsWith('Shell · Print text\n$ ')).toBe(true);
+    expect(last?.text).toContain('$ echo');
+    // Long command is one-line truncated.
+    expect(last?.text.split('\n')).toHaveLength(2);
+    expect(last?.text).toMatch(/…$/);
   });
 
   it('renders commented shell commands as action title plus command', () => {
@@ -261,6 +282,61 @@ describe('state.reducer tool-call preview', () => {
     expect(out.transcript.at(-1)?.kind).toBe('tool-call');
   });
 
+  it('compacts scope / http / skill / read like Shell (title + detail line)', () => {
+    const scope = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: '1',
+        name: 'scope',
+        args: {},
+        argsJSON: JSON.stringify({ action: 'add', pattern: 'testaspnet.vulnweb.com' }),
+      },
+    });
+    expect(scope.transcript.at(-1)?.text).toBe(
+      ['Scope · add', '│ testaspnet.vulnweb.com'].join('\n'),
+    );
+    expect(scope.transcript.at(-1)?.prefix).toBe('⏺ ');
+
+    const http = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: '2',
+        name: 'http',
+        args: {},
+        argsJSON: JSON.stringify({ method: 'GET', url: 'https://example.com/api' }),
+      },
+    });
+    expect(http.transcript.at(-1)?.text).toBe(
+      ['HTTP · GET', '│ https://example.com/api'].join('\n'),
+    );
+
+    const skill = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: '3',
+        name: 'load_skill',
+        args: {},
+        argsJSON: JSON.stringify({ name: 'webvuln', fork: true }),
+      },
+    });
+    expect(skill.transcript.at(-1)?.text).toBe('Skill · webvuln · forked');
+
+    const read = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: '4',
+        name: 'file_read',
+        args: {},
+        argsJSON: JSON.stringify({ path: 'src/cli/index.ts' }),
+      },
+    });
+    expect(read.transcript.at(-1)?.text).toBe(['Read · file', '│ src/cli/index.ts'].join('\n'));
+  });
+
   it('renders the confirm_finding result as a quiet saved-path note', () => {
     const out = reducer(seed(), {
       type: 'agent-event',
@@ -309,8 +385,8 @@ describe('state.reducer tool-call preview', () => {
     expect(last?.text).not.toContain('"options"');
   });
 
-  it('strips raw control chars from the preview', () => {
-    const args = '{"raw":"line1\nline2\tcol"}';
+  it('strips raw control chars from the shell command preview', () => {
+    const args = JSON.stringify({ command: 'printf line1\nline2\tcol' });
     const out = reducer(seed(), {
       type: 'agent-event',
       event: {
@@ -322,10 +398,11 @@ describe('state.reducer tool-call preview', () => {
       },
     });
     const last = out.transcript[out.transcript.length - 1];
-    expect(last?.text).not.toContain('\n');
+    // Title line + single $ command line (newlines flattened in the command).
+    expect(last?.text.split('\n')).toHaveLength(2);
+    expect(last?.text).toContain('Shell ·');
+    expect(last?.text).toContain('$ printf line1 line2 col');
     expect(last?.text).not.toContain('\t');
-    expect(last?.text).toContain('line1');
-    expect(last?.text).toContain('line2');
   });
 });
 
@@ -333,15 +410,24 @@ describe('state.reducer streaming / committed-live split', () => {
   const ev = (event: Parameters<typeof reducer>[1] extends { event: infer E } ? E : never) =>
     ({ type: 'agent-event', event }) as const;
 
-  it('records decision planner summaries as decision transcript entries', () => {
+  it('records decision planner summaries as quiet decision lines', () => {
     const out = reducer(
       seed(),
-      ev({ type: 'decision', summary: 'decision planner: selected skill: recon' }),
+      ev({
+        type: 'decision',
+        summary:
+          'decision planner: selected skill: graphql · risk: normal · matched graphql signals: pentest',
+      }),
     );
     expect(out.transcript.at(-1)).toMatchObject({
       kind: 'decision',
-      text: 'decision planner: selected skill: recon',
+      text: 'plan · graphql',
     });
+  });
+
+  it('keeps short plan · lines as-is', () => {
+    const out = reducer(seed(), ev({ type: 'decision', summary: 'plan · recon · high risk' }));
+    expect(out.transcript.at(-1)?.text).toBe('plan · recon · high risk');
   });
 
   it('advances the phase off "planning" as soon as a streamed delta arrives', () => {
@@ -373,6 +459,18 @@ describe('state.reducer streaming / committed-live split', () => {
     expect(s.transcript.at(-1)?.streaming).toBe(false);
     expect(s.busy).toBe(false);
   });
+
+  it('surfaces a backend retry as a visible system notice (human in the loop)', () => {
+    const s = reducer(
+      seed(),
+      ev({ type: 'retry', attempt: 2, delayMs: 1500, message: 'rate limited (429)' }),
+    );
+    const last = s.transcript.at(-1);
+    expect(last?.kind).toBe('system');
+    expect(last?.text).toContain('rate limited (429)');
+    expect(last?.text).toContain('retrying in 1.5s');
+    expect(last?.text).toContain('attempt 2');
+  });
 });
 
 describe('state.reducer clear', () => {
@@ -399,6 +497,17 @@ describe('state.reducer clear', () => {
     const cleared = reducer(withEntry, { type: 'clear' });
     expect(cleared.transcript).toHaveLength(0);
     expect(cleared.clearGen).toBe(withEntry.clearGen + 1);
+  });
+});
+
+describe('state.reducer compact mode', () => {
+  it('defaults to off and flips on set-compact-mode', () => {
+    const s = seed();
+    expect(s.compactMode).toBe(false);
+    const on = reducer(s, { type: 'set-compact-mode', on: true });
+    expect(on.compactMode).toBe(true);
+    const off = reducer(on, { type: 'set-compact-mode', on: false });
+    expect(off.compactMode).toBe(false);
   });
 });
 
@@ -450,7 +559,7 @@ describe('state.reducer tool-result body', () => {
       },
     });
     const last = out.transcript[out.transcript.length - 1];
-    expect(stripAnsi(last?.text ?? '')).toBe('[exit 1] BashTool (15ms)\nexit: 1\n(no output)');
+    expect(stripAnsi(last?.text ?? '')).toBe('[exit 1] shell (15ms)\nexit: 1\n(no output)');
   });
 
   it('renders grep no-match as no match instead of generic exit 1', () => {
@@ -477,7 +586,7 @@ describe('state.reducer tool-result body', () => {
       },
     });
     const last = out.transcript[out.transcript.length - 1];
-    expect(stripAnsi(last?.text ?? '')).toBe('[no match] BashTool (735ms)\n(no matches)');
+    expect(stripAnsi(last?.text ?? '')).toBe('[no match] shell (735ms)\n(no matches)');
   });
 
   it('labels BashTool stderr-only failures by exit code', () => {
@@ -499,7 +608,7 @@ describe('state.reducer tool-result body', () => {
       },
     });
     const plain = stripAnsi(out.transcript.at(-1)?.text ?? '');
-    expect(plain).toContain('[exit 2] BashTool (2ms)\nexit: 2\nstderr:\n/bin/bash');
+    expect(plain).toContain('[exit 2] shell (2ms)\nexit: 2\nstderr:\n/bin/bash');
     expect(plain).not.toContain('stdout:');
   });
 
@@ -542,6 +651,131 @@ describe('state.reducer tool-result body', () => {
   });
 });
 
+describe('state.reducer child-progress (↳ expandable)', () => {
+  it('upserts a live progress line and becomes collapsible when done', () => {
+    let s = seed();
+    s = reducer(s, {
+      type: 'child-progress',
+      key: 'skill:recon',
+      label: 'recon',
+      tools: [],
+      done: false,
+    });
+    expect(s.transcript).toHaveLength(1);
+    expect(s.transcript[0]?.prefix).toBe('↳ ');
+    expect(s.transcript[0]?.text).toBe('recon…');
+    expect(s.transcript[0]?.collapsible).toBeUndefined();
+
+    s = reducer(s, {
+      type: 'child-progress',
+      key: 'skill:recon',
+      label: 'recon',
+      tools: ['load_skill', 'todo'],
+      done: false,
+    });
+    expect(s.transcript).toHaveLength(1);
+    expect(s.transcript[0]?.text).toBe('recon · 2 tools…');
+
+    s = reducer(s, {
+      type: 'child-progress',
+      key: 'skill:recon',
+      label: 'recon',
+      tools: ['load_skill', 'todo', 'scope', 'BashTool'],
+      done: true,
+    });
+    expect(s.transcript).toHaveLength(1);
+    const row = s.transcript[0];
+    expect(row?.collapsible).toBe(true);
+    expect(row?.text).toContain('recon · 4 tools');
+    expect(row?.text).toContain('expand');
+    expect(row?.fullText).toContain('1. load_skill');
+    expect(row?.fullText).toContain('4. shell');
+  });
+
+  it('click/toggle expands and collapses the tool list in place', () => {
+    let s = reducer(seed(), {
+      type: 'child-progress',
+      key: 'skill:recon',
+      label: 'recon',
+      tools: ['todo', 'scope'],
+      done: true,
+    });
+    s = reducer(s, { type: 'toggle-expand', progressKey: 'skill:recon' });
+    expect(s.transcript[0]?.expanded).toBe(true);
+    s = reducer(s, { type: 'toggle-expand', progressKey: 'skill:recon' });
+    expect(s.transcript[0]?.expanded).toBe(false);
+  });
+
+  it('Ctrl-O expands progress in place without appending a second entry', () => {
+    let s = reducer(seed(), {
+      type: 'child-progress',
+      key: 'explore',
+      label: 'explore',
+      tools: ['http', 'grep'],
+      done: true,
+    });
+    s = reducer(s, { type: 'expand-tool-output' });
+    expect(s.transcript).toHaveLength(1);
+    expect(s.transcript[0]?.expanded).toBe(true);
+  });
+});
+
+describe('collapseAssistantProse', () => {
+  it('leaves short replies alone', () => {
+    const c = collapseAssistantProse('PWNED\nShort note.');
+    expect(c.collapsible).toBe(false);
+    expect(c.preview).toBe(c.full);
+  });
+
+  it('collapses long narrative with a click cue', () => {
+    const body = [
+      'The PHP file was uploaded and executed on the server.',
+      'The upload has no validation.',
+      'This is unrestricted file upload leading to RCE.',
+      'Confirming with coverage tracking next.',
+      'Reporting after reproduction is complete.',
+      'Impact is full remote code execution as www-data.',
+      'Remediation is strict content-type and extension allowlists.',
+      'PoC: upload pwn.php then GET /upload/pwn.php.',
+    ].join('\n');
+    const c = collapseAssistantProse(body);
+    expect(c.collapsible).toBe(true);
+    expect(c.preview).toContain('click to expand');
+    expect(c.preview.length).toBeLessThan(c.full.length);
+    expect(c.full).toContain('PoC: upload pwn.php');
+  });
+});
+
+describe('state.reducer collapsible assistant text', () => {
+  it('collapses a long assistant-text event for click expand', () => {
+    const body = Array.from({ length: 12 }, (_, i) => `Paragraph ${i} about the finding.`).join(
+      '\n',
+    );
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: { type: 'assistant-text', text: body },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.kind).toBe('assistant');
+    expect(last?.collapsible).toBe(true);
+    expect(last?.text).toContain('click to expand');
+    expect(last?.fullText).toContain('Paragraph 11');
+  });
+
+  it('click toggles the full assistant body in place', () => {
+    const body = Array.from({ length: 12 }, (_, i) => `Line ${i} of analysis.`).join('\n');
+    let s = reducer(seed(), {
+      type: 'agent-event',
+      event: { type: 'assistant-text', text: body },
+    });
+    const full = s.transcript[0]?.fullText;
+    s = reducer(s, { type: 'toggle-expand', fullText: full });
+    expect(s.transcript[0]?.expanded).toBe(true);
+    s = reducer(s, { type: 'toggle-expand', fullText: full });
+    expect(s.transcript[0]?.expanded).toBe(false);
+  });
+});
+
 describe('state.reducer expandable tool-result', () => {
   const ESC = String.fromCharCode(0x1b);
   const strip = (s: string) => s.replace(new RegExp(`${ESC}\\[[0-9;]*m`, 'g'), '');
@@ -568,25 +802,22 @@ describe('state.reducer expandable tool-result', () => {
     const last = withResult().transcript.at(-1);
     expect(last?.collapsible).toBe(true);
     expect(last?.expanded).toBeUndefined();
-    expect(strip(last?.text ?? '')).toContain('Ctrl-O to expand');
+    expect(strip(last?.text ?? '')).toContain('click or Ctrl-O to expand');
     expect(strip(last?.text ?? '')).not.toContain('"type"');
     // Collapsed preview is far shorter than the retained full body.
     expect(last?.text.length).toBeLessThan((last?.fullText ?? '').length);
   });
 
-  it('Ctrl-O reprints the full body as a new log entry and marks the source expanded', () => {
+  it('Ctrl-O expands in place (OpenTUI) without appending a second entry', () => {
     const expanded = reducer(withResult(), { type: 'expand-tool-output' });
-    // Source entry stays put (frozen in scrollback) but is now marked expanded.
-    expect(expanded.transcript).toHaveLength(2);
+    expect(expanded.transcript).toHaveLength(1);
     expect(expanded.transcript[0]?.expanded).toBe(true);
-    // The appended entry holds the full body.
-    const appended = expanded.transcript.at(-1);
-    expect(appended?.kind).toBe('tool-result');
-    expect(strip(appended?.text ?? '')).toContain('link "item 99"');
+    expect(strip(expanded.transcript[0]?.fullText ?? '')).toContain('link "item 99"');
 
-    // A second Ctrl-O is a no-op — the source is already expanded.
+    // A second Ctrl-O is a no-op — nothing left collapsed.
     const again = reducer(expanded, { type: 'expand-tool-output' });
-    expect(again.transcript).toHaveLength(2);
+    expect(again.transcript).toHaveLength(1);
+    expect(again.transcript[0]?.expanded).toBe(true);
   });
 
   it('expand is a no-op when nothing is collapsible', () => {
@@ -607,5 +838,38 @@ describe('state.reducer expandable tool-result', () => {
       },
     });
     expect(out.transcript.at(-1)?.collapsible).toBeUndefined();
+  });
+});
+
+describe('formatCompactEvent', () => {
+  it('renders a single Claude/Grok-style line with token delta', () => {
+    const text = formatCompactEvent({
+      type: 'compact',
+      summary: 'Context compacted',
+      tokensBefore: 9423,
+      tokensAfter: 9393,
+      memoryItems: 0,
+    });
+    expect(text).toBe('Context compacted · ~9423 → ~9393 tokens');
+    expect(text).not.toContain('memory');
+    expect(text).not.toContain('\n');
+    expect(text).not.toContain('triggered');
+    expect(text).not.toContain('auto-compacted');
+  });
+
+  it('does not dump a long LLM summary body into the transcript', () => {
+    const text = formatCompactEvent({
+      type: 'compact',
+      summary: '## Current objective\n- long prose that used to flood the UI\n'.repeat(20),
+      memoryItems: 3,
+    });
+    expect(text).toBe('Context compacted · 3 memory');
+    expect(text).not.toContain('Current objective');
+  });
+
+  it('handles nothing to compact', () => {
+    expect(formatCompactEvent({ type: 'compact', summary: 'nothing to compact' })).toBe(
+      'Nothing to compact',
+    );
   });
 });

@@ -1,9 +1,11 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { appendFile, chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { atomicWriteFileSync } from '../persist/atomicFile.js';
 import { apply as redact } from '../redact/index.js';
+import { splitMarkdownSections } from '../shared/markdownSections.js';
 
 export type IntelligenceScope = 'project' | 'personal' | 'builtin';
 
@@ -93,6 +95,11 @@ export class IntelligenceStore {
     string,
     { mtimeMs: number; size: number; scenarios: IntelligenceScenario[] }
   >();
+  // Cached deduped list (project + personal + builtin), keyed on a signature of
+  // both scope files' mtime+size so external/concurrent writes (e.g. another
+  // session learning into the shared personal scope) are still picked up.
+  // Avoids repeated concat + dedupe on every list()/search() call.
+  private listCache: { sig: string; scenarios: IntelligenceScenario[] } | null = null;
 
   constructor(opts: StoreOptions = {}) {
     const cwd = resolve(opts.cwd ?? process.cwd());
@@ -102,11 +109,25 @@ export class IntelligenceStore {
   }
 
   list(): IntelligenceScenario[] {
-    return dedupeScenarios([
+    const sig = `${this.fileSig(this.projectPath)}|${this.fileSig(this.personalPath)}`;
+    if (this.listCache && this.listCache.sig === sig) return this.listCache.scenarios;
+    const scenarios = dedupeScenarios([
       ...this.readScenarios(this.projectPath, 'project'),
       ...this.readScenarios(this.personalPath, 'personal'),
       ...BUILTIN_SCENARIOS,
     ]);
+    this.listCache = { sig, scenarios };
+    return scenarios;
+  }
+
+  /** Cheap on-disk signature for a scope file ('0:0' when absent). */
+  private fileSig(path: string): string {
+    try {
+      const s = statSync(path);
+      return `${s.mtimeMs}:${s.size}`;
+    } catch {
+      return '0:0';
+    }
   }
 
   // Cached read of a scope file. Invalidated when the file's mtime or size
@@ -129,6 +150,7 @@ export class IntelligenceStore {
 
   private invalidate(path: string): void {
     this.fileCache.delete(path);
+    this.listCache = null;
   }
 
   search(query: string, limit = 5): SearchResult[] {
@@ -234,11 +256,8 @@ export class IntelligenceStore {
       if (scenarios.length <= MAX_SCENARIOS_PER_FILE) return;
       const kept = scenarios.slice(scenarios.length - MAX_SCENARIOS_PER_FILE);
       const body = `${kept.map((s) => JSON.stringify(s)).join('\n')}\n`;
-      // Atomic rewrite: tmp + rename so a crash mid-prune can't truncate the
-      // knowledge base.
-      const tmp = `${path}.tmp.${randomBytes(3).toString('hex')}`;
-      writeFileSync(tmp, body, { mode: 0o600 });
-      renameSync(tmp, path);
+      // Atomic rewrite so a crash mid-prune can't truncate the knowledge base.
+      atomicWriteFileSync(path, body);
       this.invalidate(path);
     } catch {
       // Best effort — a prune failure must not break learning.
@@ -357,7 +376,7 @@ function extractScenarios(text: string, sourceSessionId?: string): ScenarioInput
     });
   }
 
-  const sections = splitMarkdownSections(text);
+  const sections = splitMarkdownSections(text, normalizeHeading);
   const preferenceItems = [
     ...sectionItems(sections, [
       'user preferences and working style',
@@ -550,22 +569,6 @@ function extractScenarios(text: string, sourceSessionId?: string): ScenarioInput
   }
 
   return dedupeScenarioInputs(out).slice(0, 25);
-}
-
-function splitMarkdownSections(text: string): Map<string, string[]> {
-  const sections = new Map<string, string[]>();
-  let current = 'summary';
-  sections.set(current, []);
-  for (const line of text.split(/\r?\n/)) {
-    const heading = line.match(/^#{1,3}\s+(.+?)\s*$/);
-    if (heading) {
-      current = normalizeHeading(heading[1] ?? '');
-      if (!sections.has(current)) sections.set(current, []);
-      continue;
-    }
-    sections.get(current)?.push(line);
-  }
-  return sections;
 }
 
 function sectionItems(sections: Map<string, string[]>, names: string[]): string[] {

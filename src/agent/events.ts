@@ -43,12 +43,45 @@ export interface SkillActiveEvent {
   type: 'skill-active';
   name: string;
 }
+export interface TodoItem {
+  id: string;
+  text: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
+export interface TodoEvent {
+  type: 'todo';
+  items: TodoItem[];
+}
 export interface MemoryRecallEvent {
   type: 'memory-recall';
   names: string[];
 }
 export interface DoneEvent {
   type: 'done';
+}
+/**
+ * Fired before the LLM client backs off and retries a transient failure
+ * (rate limit, 5xx). Without this the retry wait (up to a few seconds,
+ * doubling per attempt) is invisible — the turn just looks stalled. The TUI
+ * surfaces it as a transcript notice so a slow turn reads as "backend is
+ * rate-limiting, retrying" instead of "the agent silently hung/kept going".
+ */
+export interface RetryEvent {
+  type: 'retry';
+  attempt: number;
+  delayMs: number;
+  message: string;
+}
+
+/** Progress from a forked child agent (delegate_task / skill fork). */
+export interface SubagentProgressEvent {
+  type: 'subagent-progress';
+  role: string;
+  phase: 'start' | 'tool' | 'done';
+  /** Tool name when phase === 'tool'. */
+  tool?: string;
+  step?: number;
+  detail?: string;
 }
 
 export type AgentEvent =
@@ -60,11 +93,14 @@ export type AgentEvent =
   | CompactEvent
   | DecisionEvent
   | SkillActiveEvent
+  | TodoEvent
   | MemoryRecallEvent
+  | RetryEvent
+  | SubagentProgressEvent
   | DoneEvent;
 
-/** MaxStepsError is the recognizable Error subtype raised when the tool
- *  loop hits the per-turn cap. The TUI promotes it to a friendlier alert. */
+/** MaxStepsError is raised when the tool loop hits the per-turn budget.
+ *  The TUI auto-continues quietly (Claude Code / Grok style) — no modal. */
 export class MaxStepsError extends Error {
   readonly steps: number;
   constructor(steps: number) {

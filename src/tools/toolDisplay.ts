@@ -7,6 +7,8 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   ask_user: 'Ask User',
   confirm_finding: 'Confirmed Finding',
   load_skill: 'Skill',
+  BashTool: 'shell',
+  bash: 'shell',
   mcp_browser_browser_navigate: 'Browser',
   mcp_browser_browser_click: 'Browser Click',
   web_fetch: 'Web Fetch',
@@ -54,7 +56,10 @@ export function primaryToolArg(name: string, args: Record<string, unknown>): str
   }
   if (name === 'load_skill') {
     const skillName = args.name;
-    if (typeof skillName === 'string' && skillName) return skillName;
+    if (typeof skillName === 'string' && skillName) {
+      // Forked runs already show progress/result separately; mark the call clearly.
+      return args.fork === true ? `${skillName} · forked` : skillName;
+    }
   }
   if (name === 'ask_user') {
     return formatAskUserCall(args);
@@ -87,6 +92,14 @@ export function formatToolResult(name: string, result: string): string | null {
 }
 
 function formatLoadSkillResult(result: string): string | null {
+  // Skill-fork summary: "[skill-fork/recon: 4 tool call(s) — …]\n\n…"
+  const fork = result.match(/^\[skill-fork\/([^\]:\s]+):\s*(\d+)\s*tool/i);
+  if (fork) {
+    const name = fork[1] ?? 'skill';
+    const n = fork[2] ?? '0';
+    return `forked ${name} · ${n} tools`;
+  }
+
   const skill = result.match(/^# Skill:\s*(.+)$/m)?.[1]?.trim();
   if (!skill) return null;
 

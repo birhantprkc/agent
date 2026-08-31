@@ -5,9 +5,16 @@
 
 import type { Backend } from '../config/config.js';
 import {
+  getOpenAISchemeProvider,
+  isOpenAISchemeProvider,
+  openaiSchemeBackendIds,
+} from './providerRegistry.js';
+import {
   ANTHROPIC_DEFAULT_BASE_URL,
   ANTHROPIC_RECOMMENDED_MODELS,
   ANTHROPIC_VERSION,
+  DAHL_DEFAULT_BASE_URL,
+  DAHL_MODELS,
   DEEPSEEK_DEFAULT_BASE_URL,
   DEEPSEEK_MODELS,
   GEMINI_DEFAULT_BASE_URL,
@@ -16,23 +23,36 @@ import {
   GROQ_MODELS,
   KIMI_DEFAULT_BASE_URL,
   KIMI_MODELS,
+  NARAYA_DEFAULT_BASE_URL,
+  NARAYA_MODELS,
+  OPENAI_DEFAULT_BASE_URL,
+  OPENAI_RECOMMENDED_MODELS,
   OPENROUTER_DEFAULT_BASE_URL,
+  OPENROUTER_POPULAR_MODELS,
   OPENROUTER_RECOMMENDED_MODELS,
 } from './providers.js';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 
-const DEFAULT_BASE_URL: Record<Exclude<Backend, ''>, string> = {
-  ollama: 'http://localhost:11434',
-  lmstudio: 'http://localhost:1234/v1',
-  'openai-compat': '',
-  kimi: KIMI_DEFAULT_BASE_URL,
-  groq: GROQ_DEFAULT_BASE_URL,
-  openrouter: OPENROUTER_DEFAULT_BASE_URL,
-  deepseek: DEEPSEEK_DEFAULT_BASE_URL,
-  gemini: GEMINI_DEFAULT_BASE_URL,
-  anthropic: ANTHROPIC_DEFAULT_BASE_URL,
-};
+function defaultBaseURL(backend: Exclude<Backend, ''>): string {
+  const core: Partial<Record<Exclude<Backend, ''>, string>> = {
+    ollama: 'http://localhost:11434',
+    lmstudio: 'http://localhost:1234/v1',
+    openai: OPENAI_DEFAULT_BASE_URL,
+    'openai-compat': '',
+    kimi: KIMI_DEFAULT_BASE_URL,
+    groq: GROQ_DEFAULT_BASE_URL,
+    openrouter: OPENROUTER_DEFAULT_BASE_URL,
+    deepseek: DEEPSEEK_DEFAULT_BASE_URL,
+    gemini: GEMINI_DEFAULT_BASE_URL,
+    anthropic: ANTHROPIC_DEFAULT_BASE_URL,
+    naraya: NARAYA_DEFAULT_BASE_URL,
+    dahl: DAHL_DEFAULT_BASE_URL,
+  };
+  if (core[backend] !== undefined) return core[backend] ?? '';
+  const preset = getOpenAISchemeProvider(backend);
+  return preset?.baseURL ?? '';
+}
 
 /**
  * Query the backend's model-list endpoint and return the IDs. Throws
@@ -56,7 +76,7 @@ export async function listModels(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const b: Exclude<Backend, ''> = backend === '' ? 'ollama' : backend;
-  const base = baseURL || DEFAULT_BASE_URL[b];
+  const base = baseURL || defaultBaseURL(b);
   if (!base) throw new Error(`${b} backend requires a base URL`);
 
   const path = b === 'ollama' ? '/api/tags' : '/models';
@@ -123,18 +143,40 @@ function parseModels(backend: Exclude<Backend, ''>, body: unknown): string[] {
   const ids = data
     .map((m) => (typeof m.id === 'string' ? m.id : ''))
     .filter((n): n is string => n.length > 0);
-  if (backend === 'kimi') return preferKnownModels(ids, KIMI_MODELS);
-  if (backend === 'groq') return preferKnownModels(ids, GROQ_MODELS);
+  // Always appendUnknown so a live catalog that adds models we haven't curated
+  // yet still surfaces them in /model list (previously kimi/groq/deepseek
+  // silently dropped anything not in the hard-coded list).
+  if (backend === 'kimi') return preferKnownModels(ids, KIMI_MODELS, { appendUnknown: true });
+  if (backend === 'groq') return preferKnownModels(ids, GROQ_MODELS, { appendUnknown: true });
   if (backend === 'openrouter') {
     return preferOpenRouterModels(ids);
   }
-  if (backend === 'deepseek') return preferKnownModels(ids, DEEPSEEK_MODELS);
+  if (backend === 'openai') {
+    return preferKnownModels(ids, OPENAI_RECOMMENDED_MODELS, { appendUnknown: true });
+  }
+  if (backend === 'deepseek')
+    return preferKnownModels(ids, DEEPSEEK_MODELS, { appendUnknown: true });
+  if (backend === 'naraya') {
+    // naraya serves a huge multi-vendor catalog; float the curated first-class
+    // ids to the top and keep the rest below so nothing is hidden.
+    return preferKnownModels(ids, NARAYA_MODELS, { appendUnknown: true });
+  }
   if (backend === 'anthropic') {
     // Anthropic's /v1/models uses the same { data: [{ id }] } envelope; float
     // the known recommended ids to the top, keep any newer ones below.
     return preferKnownModels(ids, ANTHROPIC_RECOMMENDED_MODELS, { appendUnknown: true });
   }
+  if (backend === 'dahl') return preferKnownModels(ids, DAHL_MODELS, { appendUnknown: true });
+  if (isOpenAISchemeProvider(backend)) {
+    const p = getOpenAISchemeProvider(backend);
+    return preferKnownModels(ids, p?.models ?? [], { appendUnknown: true });
+  }
   return ids;
+}
+
+/** Curated model lists for OpenCode-aligned OpenAI-scheme backends (tests/help). */
+export function registeredOpenAISchemeBackends(): string[] {
+  return openaiSchemeBackendIds();
 }
 
 function preferGeminiRecommended(models: string[]): string[] {
@@ -145,7 +187,8 @@ function preferOpenRouterModels(models: string[]): string[] {
   const withAuto = models.includes('openrouter/auto')
     ? models
     : [...OPENROUTER_RECOMMENDED_MODELS, ...models];
-  return preferKnownModels(withAuto, OPENROUTER_RECOMMENDED_MODELS, { appendUnknown: true });
+  // Float auto + popular agent-friendly ids, then the full live catalog.
+  return preferKnownModels(withAuto, OPENROUTER_POPULAR_MODELS, { appendUnknown: true });
 }
 
 function preferKnownModels(

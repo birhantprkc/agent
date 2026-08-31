@@ -109,6 +109,63 @@ function privateIPv4Reason(host: string): string {
 }
 
 function privateIPv6Reason(host: string): string {
+  // Expand all spellings (compressed + fully expanded) to 8 hextets so
+  // `0:0:0:0:0:0:0:1` and `::1` hit the same checks. Literal-string matches
+  // alone miss expanded loopback / IPv4-mapped forms and silently skip the
+  // private-host permission prompt.
+  const hextets = expandIPv6(host);
+  if (hextets) {
+    // Loopback ::1
+    if (hextets.every((h, i) => (i === 7 ? h === 1 : h === 0))) return 'loopback IPv6';
+    // Unspecified ::
+    if (hextets.every((h) => h === 0)) return 'unspecified IPv6';
+    // IPv4-mapped ::ffff:a.b.c.d (and expanded 0:0:0:0:0:ffff:…)
+    if (
+      hextets[0] === 0 &&
+      hextets[1] === 0 &&
+      hextets[2] === 0 &&
+      hextets[3] === 0 &&
+      hextets[4] === 0 &&
+      hextets[5] === 0xffff
+    ) {
+      const hi = hextets[6] ?? 0;
+      const lo = hextets[7] ?? 0;
+      const dotted = `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+      return privateIPv4Reason(dotted) || '';
+    }
+    // NAT64 64:ff9b::/96 — embedded v4 in low 32 bits
+    if (
+      hextets[0] === 0x64 &&
+      hextets[1] === 0xff9b &&
+      hextets[2] === 0 &&
+      hextets[3] === 0 &&
+      hextets[4] === 0 &&
+      hextets[5] === 0
+    ) {
+      const hi = hextets[6] ?? 0;
+      const lo = hextets[7] ?? 0;
+      const dotted = `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+      const reason = privateIPv4Reason(dotted);
+      if (reason) return `NAT64-embedded ${reason} (${dotted})`;
+    }
+    // 6to4 2002::/16 — IPv4 in bits 16-48
+    if (hextets[0] === 0x2002) {
+      const h1 = hextets[1] ?? 0;
+      const h2 = hextets[2] ?? 0;
+      const v4 = hextetsToIPv4(h1.toString(16), h2.toString(16));
+      const reason = v4 ? privateIPv4Reason(v4) : '';
+      if (reason && v4) return `6to4-embedded ${reason} (${v4})`;
+    }
+    const h0 = hextets[0] ?? 0;
+    // Link-local fe80::/10
+    if ((h0 & 0xffc0) === 0xfe80) return 'link-local IPv6';
+    // Unique local fc00::/7
+    if ((h0 & 0xfe00) === 0xfc00) return 'unique-local IPv6';
+    return '';
+  }
+
+  // Fallback for odd forms expandIPv6 couldn't parse: keep prior compressed
+  // string matches so we never regress known good paths.
   const mappedDotted = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
   if (mappedDotted?.[1]) return privateIPv4Reason(mappedDotted[1]) || '';
   const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
@@ -120,16 +177,12 @@ function privateIPv6Reason(host: string): string {
       return privateIPv4Reason(dotted) || '';
     }
   }
-  // NAT64 (64:ff9b::/96) carries the destination IPv4 in the low 32 bits, so a
-  // request to `64:ff9b::169.254.169.254` reaches cloud metadata on an
-  // IPv6-only/NAT64 network. Flag only when the embedded v4 is itself private.
   const nat64 = host.match(/^64:ff9b::(?:ffff:)?(.+)$/i);
   if (nat64?.[1]) {
     const v4 = embeddedIPv4(nat64[1]);
     const reason = v4 ? privateIPv4Reason(v4) : '';
     if (reason && v4) return `NAT64-embedded ${reason} (${v4})`;
   }
-  // 6to4 (2002::/16) embeds the IPv4 in bits 16-48: 2002:AABB:CCDD::.
   const sixToFour = host.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})\b/i);
   if (sixToFour?.[1] && sixToFour[2]) {
     const v4 = hextetsToIPv4(sixToFour[1], sixToFour[2]);
@@ -141,6 +194,49 @@ function privateIPv6Reason(host: string): string {
   if (host.startsWith('fe80:')) return 'link-local IPv6';
   if (/^f[cd][0-9a-f]{2}:/i.test(host)) return 'unique-local IPv6';
   return '';
+}
+
+/**
+ * Expand an IPv6 literal into 8 numeric hextets, or null if unparseable.
+ * Handles compressed `::`, dotted IPv4 tails (`::ffff:127.0.0.1`), and fully
+ * expanded forms. Does not resolve zone ids (`%eth0`).
+ */
+function expandIPv6(host: string): number[] | null {
+  let h = host.toLowerCase();
+  // Zone id (fe80::1%lo0) — strip for classification.
+  const zone = h.indexOf('%');
+  if (zone >= 0) h = h.slice(0, zone);
+
+  // Replace a trailing dotted IPv4 with two hextets.
+  const v4tail = h.match(/^(.*:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (v4tail?.[1] && v4tail[2]) {
+    const parts = v4tail[2].split('.').map((p) => Number.parseInt(p, 10));
+    if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) {
+      return null;
+    }
+    const [a, b, c, d] = parts as [number, number, number, number];
+    h = `${v4tail[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+
+  if (h.includes('::')) {
+    const [leftRaw, rightRaw] = h.split('::');
+    if (h.indexOf('::') !== h.lastIndexOf('::')) return null; // multiple ::
+    const left = leftRaw ? leftRaw.split(':').filter(Boolean) : [];
+    const right = rightRaw ? rightRaw.split(':').filter(Boolean) : [];
+    const missing = 8 - left.length - right.length;
+    if (missing < 0) return null;
+    const filled = [...left, ...Array(missing).fill('0'), ...right];
+    if (filled.length !== 8) return null;
+    const nums = filled.map((x) => Number.parseInt(x, 16));
+    if (nums.some((n) => !Number.isFinite(n) || n < 0 || n > 0xffff)) return null;
+    return nums;
+  }
+
+  const parts = h.split(':');
+  if (parts.length !== 8) return null;
+  const nums = parts.map((x) => Number.parseInt(x, 16));
+  if (nums.some((n) => !Number.isFinite(n) || n < 0 || n > 0xffff)) return null;
+  return nums;
 }
 
 /** Extract a trailing embedded IPv4 from an IPv6 tail, dotted or hex form. */

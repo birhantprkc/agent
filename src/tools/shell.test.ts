@@ -1,6 +1,7 @@
 // Shell denylist + execution tests.
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { BackgroundTaskManager } from '../agent/backgroundTasks.js';
 import { AlwaysAllow } from '../permission/permission.js';
 import {
   BashTool,
@@ -73,6 +74,42 @@ describe('ShellTool.run', () => {
     expect(out).toContain('exit: 0');
     expect(out).toContain('hello');
     expect(out).toContain('world');
+  });
+
+  it('rejects background=true when no BackgroundTaskManager was wired in', async () => {
+    const t = new ShellTool();
+    await expect(
+      t.run(
+        { command: 'echo hi', background: true },
+        new AbortController().signal,
+        new AlwaysAllow(),
+      ),
+    ).rejects.toThrow(/background execution is not available/);
+  });
+
+  it('background=true returns immediately with a task id instead of waiting', async () => {
+    const mgr = new BackgroundTaskManager();
+    const t = new ShellTool('/bin/sh', 'shell', mgr);
+    const out = await t.run(
+      { command: 'echo hi', background: true },
+      new AbortController().signal,
+      new AlwaysAllow(),
+    );
+    expect(out).toContain('started as background task bg');
+    expect(mgr.list()).toHaveLength(1);
+  });
+
+  it('still runs the denylist/portability checks before branching to background', async () => {
+    const mgr = new BackgroundTaskManager();
+    const t = new ShellTool('/bin/sh', 'shell', mgr);
+    await expect(
+      t.run(
+        { command: 'rm -rf /', background: true },
+        new AbortController().signal,
+        new AlwaysAllow(),
+      ),
+    ).rejects.toThrow(/blocked by denylist/);
+    expect(mgr.list()).toHaveLength(0);
   });
 
   it('rejects a blocked command before spawn', async () => {

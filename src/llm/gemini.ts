@@ -1,8 +1,8 @@
 import type { Client, Pinger, StreamingClient } from './client.js';
 import { type BackendError, classifyBackend, parseRetryAfter } from './errors.js';
 import { newCallID } from './ids.js';
-import { withRetry } from './retry.js';
-import type { ChatRequest, ChatResponse, Message, ToolSpec } from './types.js';
+import { type RetryInfo, withRetry } from './retry.js';
+import type { ChatRequest, ChatResponse, Message, ToolSpec, Usage } from './types.js';
 
 /** Annotate a backend error with the server's Retry-After so withRetry can
  *  honor it instead of its computed backoff. */
@@ -36,6 +36,12 @@ interface GeminiContent {
   parts: GeminiPart[];
 }
 
+interface GeminiUsage {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  cachedContentTokenCount?: number;
+}
+
 interface GeminiResponse {
   candidates?: Array<{
     content?: {
@@ -44,6 +50,16 @@ interface GeminiResponse {
     finishReason?: string;
   }>;
   error?: { message?: string };
+  usageMetadata?: GeminiUsage;
+}
+
+function toUsage(u: GeminiUsage | undefined): Usage | undefined {
+  if (!u) return undefined;
+  return {
+    inputTokens: u.promptTokenCount ?? 0,
+    outputTokens: u.candidatesTokenCount ?? 0,
+    cachedInputTokens: u.cachedContentTokenCount,
+  };
 }
 const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -93,15 +109,21 @@ export class GeminiClient implements Client, StreamingClient, Pinger {
       headers: { 'x-goog-api-key': this.apiKey },
       signal,
     });
-    if (resp.status >= 500) {
+    // Any non-2xx means disconnected — see openai.ts ping() for why 4xx
+    // must fail too, not just 5xx.
+    if (resp.status < 200 || resp.status >= 300) {
       throw new Error(`gemini status ${resp.status}`);
     }
   }
 
-  async chat(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
+  async chat(
+    req: ChatRequest,
+    signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
+  ): Promise<ChatResponse> {
     // Retry rate limits / transient 5xx with backoff (E7). The call has no
     // observable side effects before it returns, so re-running it is safe.
-    return withRetry(() => this.chatOnce(req, signal), { signal });
+    return withRetry(() => this.chatOnce(req, signal), { signal, onRetry });
   }
 
   private async chatOnce(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
@@ -153,7 +175,11 @@ export class GeminiClient implements Client, StreamingClient, Pinger {
       if (calls.length > 0) {
         msg.toolCalls = calls.map(partToToolCall);
       }
-      return { message: msg, finishReason: choice.finishReason ?? '' };
+      return {
+        message: msg,
+        finishReason: choice.finishReason ?? '',
+        usage: toUsage(out.usageMetadata),
+      };
     } finally {
       dispose();
     }
@@ -163,11 +189,15 @@ export class GeminiClient implements Client, StreamingClient, Pinger {
     req: ChatRequest,
     onDelta: (delta: string) => void,
     signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
   ): Promise<ChatResponse> {
     // Retry only the connection setup (E7): a transient 429/5xx surfaces before
     // any delta is emitted, so re-running openStream can't double-emit tokens.
     // Once the 200 stream is flowing, a mid-stream failure is NOT retried.
-    const { resp, dispose } = await withRetry(() => this.openStream(req, signal), { signal });
+    const { resp, dispose } = await withRetry(() => this.openStream(req, signal), {
+      signal,
+      onRetry,
+    });
     if (!resp.body) {
       dispose();
       throw new Error('gemini: empty stream body');
@@ -180,6 +210,7 @@ export class GeminiClient implements Client, StreamingClient, Pinger {
     const chunks: string[] = [];
     const calls: GeminiPart[] = [];
     let finish = '';
+    let usage: GeminiUsage | undefined;
 
     try {
       for await (const line of iterSSE(resp.body)) {
@@ -195,6 +226,9 @@ export class GeminiClient implements Client, StreamingClient, Pinger {
         if (chunk.error?.message) {
           throw classifyBackend('gemini', null, 200, chunk.error.message);
         }
+        // usageMetadata rides on every chunk cumulatively; keep the last one
+        // seen so the final tally reflects the whole response.
+        if (chunk.usageMetadata) usage = chunk.usageMetadata;
         const choice = chunk.candidates?.[0];
         if (!choice) continue;
         if (choice.finishReason) finish = choice.finishReason;
@@ -219,7 +253,7 @@ export class GeminiClient implements Client, StreamingClient, Pinger {
     if (calls.length > 0) {
       msg.toolCalls = calls.map(partToToolCall);
     }
-    return { message: msg, finishReason: finish };
+    return { message: msg, finishReason: finish, usage: toUsage(usage) };
   }
 
   /** Open the SSE stream and return the live 200 response paired with a
@@ -288,6 +322,11 @@ function partToToolCall(part: GeminiPart): NonNullable<Message['toolCalls']>[num
  * Decode a byte stream into SSE-style logical lines, splitting on `\n`. Yields
  * each non-empty line so the caller can inspect the `data:` prefix.
  */
+// A broken or malicious proxy streaming a large payload with no newlines
+// would otherwise grow `buffer` without limit (memory exhaustion) — it's
+// only ever appended to between newlines and never capped.
+const MAX_SSE_LINE_BYTES = 8 * 1024 * 1024;
+
 async function* iterSSE(body: ReadableStream<Uint8Array>): AsyncIterable<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -303,6 +342,9 @@ async function* iterSSE(body: ReadableStream<Uint8Array>): AsyncIterable<string>
         buffer = buffer.slice(idx + 1);
         if (line) yield line;
         idx = buffer.indexOf('\n');
+      }
+      if (buffer.length > MAX_SSE_LINE_BYTES) {
+        throw new Error(`SSE stream: line exceeded ${MAX_SSE_LINE_BYTES} bytes with no newline`);
       }
     }
     buffer += decoder.decode();
@@ -343,7 +385,9 @@ function encodeRequest(
     .filter((m) => m.role === 'system')
     .map((m) => m.content)
     .join('\n\n');
-  const contents = req.messages.filter((m) => m.role !== 'system').flatMap((m) => encodeMessage(m));
+  const contents = mergeAdjacentSameRole(
+    req.messages.filter((m) => m.role !== 'system').flatMap((m) => encodeMessage(m)),
+  );
   const body: Record<string, unknown> = {
     contents,
   };
@@ -383,6 +427,26 @@ function encodeRequest(
 function withModelsPrefix(id: string): string {
   if (id.startsWith('models/') || id.startsWith('tunedModels/')) return id;
   return `models/${id}`;
+}
+
+// Parallel tool execution (agent.ts executeToolCalls) records one 'tool'
+// Message per call, which encodeMessage each turns into its own 'user'
+// Content with a single functionResponse part. Gemini's function-call/
+// function-response pairing degrades badly when a turn's responses are split
+// across multiple Contents instead of batched into one — mirror the same
+// merge used for the Anthropic backend so a turn's tool results land in a
+// single Content with multiple parts, in order.
+function mergeAdjacentSameRole(contents: GeminiContent[]): GeminiContent[] {
+  const out: GeminiContent[] = [];
+  for (const c of contents) {
+    const last = out[out.length - 1];
+    if (last && last.role === c.role) {
+      last.parts = [...last.parts, ...c.parts];
+    } else {
+      out.push({ role: c.role, parts: [...c.parts] });
+    }
+  }
+  return out;
 }
 
 function encodeMessage(m: Message): GeminiContent[] {

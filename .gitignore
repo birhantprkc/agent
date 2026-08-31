@@ -1,28 +1,54 @@
+# Dependencies & build
 node_modules/
 dist/
 /coverage/
-.DS_Store
-*.log
-.env
-.env.local
 .tsbuildinfo
 .tsimp/
 .vitest/
+
+# Logs & env
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
 
 # Editor / local tooling
 .idea/
 .vscode/
 *.swp
+.playwright-mcp/
+.grok/
 
-# Local agent/harness config — never commit (may contain target hosts)
+# Agent harness configs (may contain target hosts / secrets)
 .claude/
+.cursor/
 
-# Marketing/docs site — developed separately, not tracked in this repo
+# Secrets / keys — never commit
+*.pem
+id_ed25519*
+id_rsa*
+force
+force.pub
+
+# Marketing site — developed separately
 /web/
 
-# Local agent state & scan output — never commit. Anchored to the repo
-# root so they don't also exclude source dirs like src/findings/.
+# Local engagement output (repo root only — not src/findings/ source code)
 /findings/
 /recon/
+/reports/
 /.pentesterflow/
 bughunter-report-*.md
+results_*.txt
+results_*.json
+**/cookies.txt
+__pycache__/
+*.pyc
+
+# One-off scripts / scratch (not part of the agent package)
+subdomain_enum.py
+subfinder.py
+*.tmp
+*.bak
+.DS_Store

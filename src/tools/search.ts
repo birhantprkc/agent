@@ -12,6 +12,28 @@ import { gateSensitivePath } from './file.js';
 import { type Tool, argBool, argNumber, argString } from './types.js';
 
 const GREP_FILE_BYTE_CAP = 5 * 1024 * 1024;
+// ReDoS guards. `pattern` comes straight from the LLM and re.test() runs
+// synchronously on the single JS thread with no way to interrupt mid-call —
+// a catastrophic-backtracking pattern matched against one adversarial line
+// (a saved HTTP response, a fuzzed log line) can hang the whole process
+// indefinitely. Two layers: reject patterns whose shape is a classic
+// exponential-blowup trigger before compiling, and cap how much of any one
+// line we ever feed to test() so a bad pattern's worst case stays bounded
+// even if it slips past the heuristic.
+const GREP_MAX_LINE_CHARS = 4000;
+const GREP_FILE_TIME_BUDGET_MS = 5000;
+// Nested/stacked quantifiers are the classic trigger for exponential
+// backtracking: a quantified group that itself contains a quantifier
+// (`(a+)+`, `(a*)*`, `(a+){2,}`) or two adjacent quantified atoms with
+// overlapping character classes both explode on crafted input. This is a
+// heuristic, not a proof — it deliberately errs toward rejecting anything
+// pattern-shaped like the known-dangerous cases rather than trying to prove
+// safety.
+const RISKY_REGEX_RE = /\([^()]*[+*][^()]*\)[+*]|\([^()]*[+*][^()]*\)\{\d*,/;
+
+function isRegexTooRisky(pattern: string): boolean {
+  return RISKY_REGEX_RE.test(pattern);
+}
 const SKIP_DIR_NAMES = new Set([
   'node_modules',
   '.git',
@@ -101,6 +123,11 @@ export class GrepTool implements Tool {
   async run(args: Record<string, unknown>, signal: AbortSignal, p: Prompter): Promise<string> {
     const rawPattern = argString(args, 'pattern');
     if (!rawPattern) throw new Error('pattern is required');
+    if (isRegexTooRisky(rawPattern)) {
+      throw new Error(
+        'pattern rejected: nested/stacked quantifiers can cause catastrophic backtracking (e.g. (a+)+) — simplify the pattern',
+      );
+    }
     const ignoreCase = argBool(args, 'ignore_case');
     const flags = ignoreCase ? 'i' : '';
     let re: RegExp;
@@ -237,9 +264,12 @@ async function grepEntries(
         results[i] = [];
         continue;
       }
-      await gateSensitivePath(p, entry.path, 'search', signal);
+      // I/O on the gate-resolved real path (not the lexical one) so a symlink
+      // swap between check and read can't smuggle a sensitive file past the
+      // prompt — same contract as file.ts (M1 residual).
+      const real = await gateSensitivePath(p, entry.path, 'search', signal);
       const remaining = Math.max(0, limit - matched);
-      const m = await grepFile(entry.path, re, remaining, signal);
+      const m = await grepFile(real, re, remaining, signal);
       results[i] = m;
       matched += m.length;
     }
@@ -280,13 +310,25 @@ async function grepFile(
     crlfDelay: Number.POSITIVE_INFINITY,
   });
   let lineNo = 0;
+  const startedAt = Date.now();
   try {
     for await (const line of rl) {
       if (signal.aborted) break;
       lineNo += 1;
+      // A pattern that's individually cheap can still take O(n^2)+ time
+      // across enough long lines; bail out of this file rather than let one
+      // adversarial file stall the whole grep call.
+      if (Date.now() - startedAt > GREP_FILE_TIME_BUDGET_MS) {
+        out.push(`${path}: [search time budget exceeded, remaining lines skipped]`);
+        break;
+      }
+      // Bound worst-case backtracking cost regardless of pattern shape —
+      // only the first GREP_MAX_LINE_CHARS of an oversized line are tested.
+      const testLine =
+        line.length > GREP_MAX_LINE_CHARS ? line.slice(0, GREP_MAX_LINE_CHARS) : line;
       // Reset regex state for global flag (we don't set /g but be safe).
       re.lastIndex = 0;
-      if (re.test(line)) {
+      if (re.test(testLine)) {
         out.push(`${path}:${lineNo}:${line}`);
         if (out.length >= remaining) break;
       }

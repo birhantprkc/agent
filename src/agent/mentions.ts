@@ -18,8 +18,8 @@ const INDEX_DIR_CAP = 1000;
 const INDEX_DEPTH_CAP = 12;
 
 let indexCwd = '';
-let indexBuiltAt = 0;
 let mentionIndex: Map<string, string[]> | null = null;
+let lastIndexBuildAttempt = 0;
 
 export function expandFileMentions(input: string): string {
   const mentions = extractMentions(input);
@@ -140,12 +140,15 @@ function findByBaseName(name: string, limit: number): string[] {
   if (indexCwd !== cwd || mentionIndex === null) {
     mentionIndex = buildIndex(cwd);
     indexCwd = cwd;
-    indexBuiltAt = Date.now();
+    lastIndexBuildAttempt = Date.now();
   }
   let matches = mentionIndex.get(name) ?? [];
-  if (matches.length === 0 && Date.now() - indexBuiltAt > REBUILD_COOLDOWN_MS) {
+  // Only re-walk on an actual miss (a file created since the last build),
+  // cooldown-throttled. A proactive time-based rebuild would re-walk the whole
+  // tree on every successful lookup once the cooldown elapsed.
+  if (matches.length === 0 && Date.now() - lastIndexBuildAttempt > REBUILD_COOLDOWN_MS) {
     mentionIndex = buildIndex(cwd);
-    indexBuiltAt = Date.now();
+    lastIndexBuildAttempt = Date.now();
     matches = mentionIndex.get(name) ?? [];
   }
   return [...matches].sort().slice(0, limit);
@@ -229,10 +232,14 @@ export function mentionCandidates(partial: string, limit = 8): string[] {
 
 function ensureIndex(): void {
   const cwd = process.cwd();
+  // Cold build only. The picker calls this per keystroke, so a time-based
+  // rebuild here would re-walk the whole tree (up to INDEX_FILE_CAP files)
+  // mid-typing; cwd changes and the miss-gated rebuild in findByBaseName cover
+  // staleness without that cost.
   if (indexCwd !== cwd || mentionIndex === null) {
     mentionIndex = buildIndex(cwd);
     indexCwd = cwd;
-    indexBuiltAt = Date.now();
+    lastIndexBuildAttempt = Date.now();
   }
 }
 

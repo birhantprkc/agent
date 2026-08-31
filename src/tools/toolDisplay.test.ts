@@ -25,6 +25,10 @@ describe('displayToolName', () => {
     expect(displayToolName('web_fetch')).toBe('Web Fetch');
     expect(displayToolName('web_search')).toBe('Web Search');
   });
+  it('maps BashTool aliases to shell', () => {
+    expect(displayToolName('BashTool')).toBe('shell');
+    expect(displayToolName('bash')).toBe('shell');
+  });
   it('passes unknown tools through unchanged', () => {
     expect(displayToolName('shell')).toBe('shell');
     expect(displayToolName('not_real')).toBe('not_real');
@@ -57,6 +61,7 @@ describe('primaryToolArg', () => {
   });
   it('extracts the skill name for load_skill', () => {
     expect(primaryToolArg('load_skill', { name: 'webvuln' })).toBe('webvuln');
+    expect(primaryToolArg('load_skill', { name: 'recon', fork: true })).toBe('recon · forked');
   });
   it('summarizes ask_user questions without dumping options JSON', () => {
     expect(
@@ -112,6 +117,14 @@ describe('formatToolResult', () => {
     expect(formatToolResult('load_skill', skillBody)).toBe(
       ['loaded skill: webvuln', 'playbook: Web vuln hunting playbook'].join('\n'),
     );
+  });
+  it('renders skill-fork summaries as a short done line', () => {
+    const body = [
+      '[skill-fork/recon: 4 tool call(s) — load_skill×1, todo×1, scope×1, BashTool×1]',
+      '',
+      'Found 12 subdomains…',
+    ].join('\n');
+    expect(formatToolResult('load_skill', body)).toBe('forked recon · 4 tools');
   });
   it('renders ask_user answers as a readable summary', () => {
     const result = JSON.stringify({

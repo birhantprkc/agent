@@ -36,7 +36,7 @@ export function SlashMenu({ items, selected }: SlashMenuProps): JSX.Element | nu
             color={isSelected ? 'magenta' : undefined}
             dimColor={!isSelected}
             bold={isSelected}
-            wrap="truncate"
+            wrap="wrap"
           >
             {`  ${item.name}${args}  ${item.description}`}
           </Text>

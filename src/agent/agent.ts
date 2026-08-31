@@ -3,37 +3,63 @@
 // via the provided sink (a callback or async-iterator adapter). emit()
 // honors the signal so a wedged TUI can't keep the agent stuck.
 
-import { type IntelligenceStore, formatIntelligenceContext } from '../intelligence/store.js';
-import type { Client, StreamingClient } from '../llm/client.js';
-import { isStreaming } from '../llm/client.js';
-import type { ChatRequest, Message, ToolCall } from '../llm/types.js';
-import { parsedArgs } from '../llm/types.js';
-import { error as logError } from '../logger/logger.js';
+import { dirname } from 'node:path';
+import type { HookConfig } from '../config/config.js';
 import {
   type AddMemoryInput,
   type MemoryFact,
   type MemoryStore,
   formatMemoryRecall,
-} from '../memory/store.js';
+} from '../curatedMemory/store.js';
+import { runToolHooks } from '../hooks/hooks.js';
+import { type IntelligenceStore, formatIntelligenceContext } from '../intelligence/store.js';
+import type { Client, StreamingClient } from '../llm/client.js';
+import { isStreaming } from '../llm/client.js';
+import type { RetryInfo } from '../llm/retry.js';
+import type { ChatRequest, Message, ToolCall } from '../llm/types.js';
+import { parsedArgs } from '../llm/types.js';
+import { error as logError } from '../logger/logger.js';
+import type { MemoryProvider } from '../memoryProvider/types.js';
 import type { Prompter } from '../permission/permission.js';
-import { redact } from '../redact/index.js';
+import { apply as redact } from '../redact/redact.js';
 import type { SessionMemory, Store } from '../session/store.js';
 import { type Registry as SkillRegistry, materializeSkillBody } from '../skills/registry.js';
 import type { Target } from '../target/target.js';
 import { canonicalToolName } from '../tools/aliases.js';
+import { isExploreAllowedTool } from '../tools/delegate.js';
 import type { Registry as ToolRegistry } from '../tools/registry.js';
-import { buildDecisionPlan } from './decisionPlanner.js';
-import type { AgentEvent } from './events.js';
+import type { UserProfileStore } from '../userProfile/store.js';
+import {
+  appendMemorySection,
+  boundedHistoryForCompaction,
+  buildTurnLearningText,
+  countMemoryItems,
+  formatHistoryForCompaction,
+  formatPinnedMemory,
+  mergeMemory,
+} from './compaction.js';
+import type { AgentEvent, TodoItem } from './events.js';
 import { MaxStepsError } from './events.js';
 import { expandFileMentions } from './mentions.js';
 import { ThinkingStreamFilter, stripThinkingTags } from './sanitize.js';
+import { buildObserveNote, routeSkill } from './skillRouter.js';
 import { type PromptProfile, type ToolingProfile, buildSystemPrompt } from './systemPrompt.js';
+import { TokenAccountant } from './tokenAccountant.js';
+import { maybeOffloadToolResult } from './toolResultStore.js';
 
 export type EventSink = (e: AgentEvent) => void;
 
 export interface AgentRunOptions {
   /** When false, omit tool definitions and block any tool calls returned anyway. */
   tools?: boolean;
+  /** When false, skip @file-mention auto-expansion. `expandFileMentions`
+   *  inlines local file contents with no permission prompt (unlike file_read),
+   *  which is fine for text the user actually typed but not for
+   *  internally-built prompts that splice in model-authored text (e.g. /next
+   *  folding a coverage note into the turn) — an indirect prompt injection
+   *  there could plant an @-token that gets silently expanded into context.
+   *  Defaults to true so ordinary user turns are unaffected. */
+  expandMentions?: boolean;
 }
 
 export interface AgentOptions {
@@ -66,24 +92,61 @@ export interface AgentOptions {
   /** Operator-authored engagement notes (from .pentesterflow/engagement.md),
    *  always injected into the system prompt. Loaded once at startup. */
   engagement?: string;
+  /** What the agent has learned about the operator (~/.pentesterflow/USER.md).
+   *  Always injected into the system prompt; the agent can append to it
+   *  autonomously (update_user_profile tool) as well as via /user add. */
+  userProfileStore?: UserProfileStore | null;
+  /** Optional external memory provider (e.g. local SQLite FTS5), active
+   *  alongside — never instead of — the stores above. null/undefined when
+   *  disabled or unavailable on this Node runtime. */
+  memoryProvider?: MemoryProvider | null;
+  /** Automation hooks (pre/post-tool-call, session-start, finding-confirmed).
+   *  Defaults to none. Deliberately NOT inherited by delegate_task's
+   *  sub-agent (it's built without this option) — hook side effects stay
+   *  scoped to the top-level session. */
+  hooks?: HookConfig[];
 }
 
 /** How many consecutive auto-compaction failures we tolerate before
  *  giving up for the rest of the session. A circuit-breaker: if compaction itself is broken, we don't
  *  want to retry it on every turn. */
 const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3;
-const COMPACTION_INPUT_CHAR_LIMIT = 22_000;
 // When the model emits several independent tool calls in one step, run them
 // concurrently up to this fan-out instead of strictly one-at-a-time — recon
 // fan-outs (multiple curl/grep probes) finish in ~max(latency) rather than the
 // sum (E1). The permission prompter serializes its modal internally, so
 // approvals still appear one at a time.
 const MAX_PARALLEL_TOOL_CALLS = 4;
-// Tools whose execution mutates agent state that a later call in the SAME step
-// can observe (load_skill changes the active-skill allowlist used by the
-// allowed-tools gate). A step containing one of these falls back to sequential
-// execution so ordering stays deterministic.
-const STATEFUL_TOOLS = new Set(['load_skill']);
+// Tools whose execution mutates state a later call in the SAME step can
+// observe or race against — either agent-internal state (load_skill changes
+// the active-skill allowlist used by the allowed-tools gate) or shared
+// on-disk resources with no locking of their own (two concurrent file_write/
+// file_edit calls to the same path, two concurrent coverage marks, or two
+// concurrent confirm_finding calls can interleave last-writer-wins against
+// the same file). A step containing one of these falls back to sequential
+// execution so ordering stays deterministic. Canonical names — checked
+// against canonicalToolName() below so the PascalCase aliases models also
+// call (FileWriteTool, etc.) are covered too.
+const STATEFUL_TOOLS = new Set([
+  'load_skill',
+  'file_write',
+  'file_edit',
+  'coverage',
+  'confirm_finding',
+  // Concurrent ask_user calls clobber the single ask modal (askBridge has no
+  // queue unless serialized). Force sequential so two questions in one step
+  // never hang the turn waiting on a superseded promise.
+  'ask_user',
+  // In-memory checklist held on a single TodoTool instance — two concurrent
+  // writes (e.g. the parent and a delegated sub-agent, see delegate_task
+  // below) would last-writer-wins clobber each other's list.
+  'todo',
+  // Runs a full sub-agent that can itself call coverage/confirm_finding/
+  // file_write/todo — those Tool instances are shared by reference with the
+  // parent (see cli/index.ts's childTools construction), so delegate_task
+  // must not run concurrently with the parent's own calls into the same set.
+  'delegate_task',
+]);
 // Marker that replaces a tool result's body when the mid-turn context guard
 // elides it to keep `working` under the context window. The prefix is matched
 // to skip already-elided results on a later pass within the same turn.
@@ -130,12 +193,6 @@ async function mapWithConcurrency<T, R>(
   await Promise.all(pool);
   return results;
 }
-// Upper bound on retained items per memory list, so a long engagement can't
-// grow the persisted checkpoint (and its disk footprint) without limit. The
-// most recent items win; dedup happens in mergeList. Lists default to a much
-// smaller cap (24) — findings/credentials get this larger one because losing
-// an early confirmed finding is worse than carrying a few extra lines.
-const MAX_MEMORY_LIST = 200;
 const COMPACTION_SYSTEM_PROMPT =
   'Create a compact continuation memory for the same pentesting/coding session. Use concise Markdown with exactly these headings: Current objective, Plan, Completed tasks, Target and scope, Decisions and assumptions, Tested surface, Findings and evidence, Files and commands, Credentials and placeholders, Open TODOs, Next best actions. Preserve exact endpoints, params, IDs, files, commands, tool results that matter, confirmed negatives, and reproduction evidence. Redact secrets but keep stable placeholders. Omit chatter and failed dead ends unless they prevent repeat work.';
 
@@ -148,6 +205,8 @@ export class Agent {
   readonly target: Target;
   readonly intelligence: IntelligenceStore | null;
   readonly memoryStore: MemoryStore | null;
+  readonly userProfileStore: UserProfileStore | null;
+  readonly memoryProvider: MemoryProvider | null;
 
   private thinking: boolean;
   private maxSteps: number;
@@ -163,6 +222,8 @@ export class Agent {
   private toolingProfile: ToolingProfile;
   private promptProfile: PromptProfile;
   private streamingEnabled: boolean;
+  /** plan = read-only-ish turn (no mutating tools); act = normal. */
+  private planMode = false;
   // True while run() or compact() is mid-execution. Used to refuse a
   // client swap mid-turn — otherwise the in-flight chat continues against
   // the old client while subsequent loop iterations hit the new one.
@@ -175,15 +236,16 @@ export class Agent {
   // Skills explicitly invoked from slash commands before a turn starts.
   // These become active at the start of the next run, then are cleared.
   private pendingSkills: Set<string> = new Set();
-  // Lazily-cached token estimate for the tool JSON schemas we send on every
-  // request (req.tools). Keyed on the tool count so a registry change
-  // recomputes it cheaply; -1 means "not yet computed".
-  private toolsTokensCache = 0;
-  private toolsTokensKey = -1;
+  // Incremental token estimate for history + cumulative real backend usage
+  // (see tokenAccountant.ts for why these are split out of Agent itself).
+  private readonly tokens = new TokenAccountant();
   // True once the current runInner turn has executed at least one successful
   // tool call. Gates end-of-turn intelligence learning so clarifying questions
   // and chit-chat don't pollute the cross-session KB. Reset each runInner.
   private turnExecutedTool = false;
+  // Deliberately not passed to delegate_task's sub-agent (see AgentOptions.hooks) —
+  // hook side effects stay scoped to the top-level session.
+  private readonly hookConfig: HookConfig[];
 
   constructor(opts: AgentOptions) {
     this.client = opts.client;
@@ -193,6 +255,9 @@ export class Agent {
     this.store = opts.store ?? null;
     this.intelligence = opts.intelligence ?? null;
     this.memoryStore = opts.memoryStore ?? null;
+    this.userProfileStore = opts.userProfileStore ?? null;
+    this.memoryProvider = opts.memoryProvider ?? null;
+    this.hookConfig = opts.hooks ?? [];
     this.target = opts.target;
     this.thinking = opts.thinkingEnabled ?? false;
     this.maxSteps = opts.maxSteps && opts.maxSteps > 0 ? opts.maxSteps : 20;
@@ -210,8 +275,10 @@ export class Agent {
       memory: this.memory,
       engagement: this.engagement,
       curatedMemory: this.memoryStore?.index() ?? '',
+      userProfile: this.userProfileStore?.load() ?? '',
     });
     this.history = [{ role: 'system', content: this.sysPrompt }];
+    this.tokens.recompute(this.history);
   }
 
   // ---------- accessors ----------
@@ -240,6 +307,12 @@ export class Agent {
     };
   }
 
+  /** Live TODO list snapshot, straight from the todo tool's in-memory state. */
+  getTodos(): TodoItem[] {
+    const tool = this.tools.get('todo') as { snapshot?: () => TodoItem[] } | undefined;
+    return tool?.snapshot?.() ?? [];
+  }
+
   /** Clear learned background intelligence (the .pentesterflow/intelligence/scenarios.jsonl files).
    *  Complements the automatic prune (MAX 5000 most recent per scope).
    *  This provides user-visible control over the M13 historical growth concern.
@@ -254,6 +327,11 @@ export class Agent {
     return this.intelligence ? this.intelligence.getStats() : { project: 0, personal: 0 };
   }
 
+  /** Name of the active external memory provider, or null if none is configured. */
+  getMemoryProviderName(): string | null {
+    return this.memoryProvider?.name() ?? null;
+  }
+
   formatMemory(): string {
     if (!this.memory || countMemoryItems(this.memory) === 0) {
       return 'session memory is empty — run /compact after useful work accumulates.';
@@ -262,16 +340,67 @@ export class Agent {
     const out: string[] = [];
     out.push(`Session memory · ${m.compactions} compaction${m.compactions === 1 ? '' : 's'}`);
     if (m.lastCompactedAt) out.push(`Last compacted: ${m.lastCompactedAt}`);
-    appendMemorySection(out, 'Objectives', m.objectives);
-    appendMemorySection(out, 'Plan', m.plan);
-    appendMemorySection(out, 'Completed', m.completed);
-    appendMemorySection(out, 'Findings', m.findings);
-    appendMemorySection(out, 'Tested surface', m.tested);
+    // Pinned block first — these fields must survive compact/resume.
+    const pinned = formatPinnedMemory(m);
+    if (pinned) out.push(pinned);
     appendMemorySection(out, 'Files', m.files);
     appendMemorySection(out, 'Commands', m.commands);
     appendMemorySection(out, 'Credentials / placeholders', m.credentials);
-    appendMemorySection(out, 'TODOs', m.todos);
     return out.join('\n');
+  }
+
+  isPlanMode(): boolean {
+    return this.planMode;
+  }
+
+  setPlanMode(on: boolean): void {
+    this.planMode = on;
+  }
+
+  /** Current contents of ~/.pentesterflow/USER.md, or '' if none/not configured. */
+  getUserProfile(): string {
+    return this.userProfileStore?.load() ?? '';
+  }
+
+  /**
+   * Append one distilled note about the operator — communication style, a
+   * standing preference, an expectation. Called by /user add (explicit) and
+   * by the update_user_profile tool (the agent's own autonomous writes). A
+   * no-op if no store is configured for this session.
+   */
+  // NOTE: deliberately no `this.running` guard here, unlike the sibling
+  // methods below. update_user_profile (tools/userProfile.ts) calls this
+  // mid-turn as its designed, primary use case — every such call happens
+  // while this.running is true by definition, so that guard would reject
+  // 100% of autonomous writes instead of just the rare /user-add-while-
+  // something-else-is-running race. The race this method is still exposed
+  // to (a concurrent /compact replacing history right after this appends)
+  // is guarded one level up, at the /user add command handler, which only
+  // fires for the user-typed path.
+  async addUserProfileNote(text: string): Promise<void> {
+    if (!this.userProfileStore) return;
+    await this.userProfileStore.append(text);
+    this._lastRebuildKey = '';
+    this.rebuildSystemPrompt();
+    this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
+    await this.save();
+  }
+
+  /** Wipe ~/.pentesterflow/USER.md (the /user clear escape hatch). */
+  async clearUserProfile(): Promise<void> {
+    if (this.running) {
+      throw new Error(
+        'cannot clear user profile while a turn is in flight — cancel first with Esc',
+      );
+    }
+    if (!this.userProfileStore) return;
+    await this.userProfileStore.clear();
+    this._lastRebuildKey = '';
+    this.rebuildSystemPrompt();
+    this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
+    await this.save();
   }
 
   /**
@@ -281,10 +410,15 @@ export class Agent {
    * live in a file, not here).
    */
   async clearMemory(): Promise<void> {
+    if (this.running) {
+      throw new Error('cannot clear memory while a turn is in flight — cancel first with Esc');
+    }
     if (!this.memory || countMemoryItems(this.memory) === 0) return;
     this.memory = null;
+    this._lastRebuildKey = '';
     this.rebuildSystemPrompt();
     this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
     await this.save();
   }
 
@@ -294,6 +428,9 @@ export class Agent {
    * line can be dropped without nuking everything. Returns the removed entries.
    */
   async forgetMemory(query: string): Promise<string[]> {
+    if (this.running) {
+      throw new Error('cannot forget memory while a turn is in flight — cancel first with Esc');
+    }
     const needle = query.trim().toLowerCase();
     if (!needle) return [];
     const removed: string[] = [];
@@ -323,8 +460,10 @@ export class Agent {
       };
     }
     if (removed.length === 0) return [];
+    this._lastRebuildKey = ''; // memory contents changed; force rebuild of carried state
     this.rebuildSystemPrompt();
     this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
     await this.save();
     return removed;
   }
@@ -370,6 +509,17 @@ export class Agent {
     ].join('\n');
   }
 
+  /** Cumulative token usage across every chat/compact call this Agent instance
+   *  has made, as reported by the backend. Returns a fresh copy each call. */
+  getUsage(): {
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens: number;
+    calls: number;
+  } {
+    return this.tokens.getUsage();
+  }
+
   /** Set the auto-compact threshold (in approxTokens). 0 disables. */
   setAutoCompactThreshold(n: number): void {
     this.autoCompactThreshold = Math.max(0, Math.floor(n));
@@ -380,6 +530,7 @@ export class Agent {
     this.promptProfile = profile;
     this.rebuildSystemPrompt();
     this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
   }
 
   thinkingIsEnabled(): boolean {
@@ -389,6 +540,12 @@ export class Agent {
   async setThinkingEnabled(on: boolean): Promise<void> {
     this.thinking = on;
     this.rebuildSystemPrompt();
+    // Match every other system-prompt mutator: reseed history[0] so the live
+    // model actually sees the new thinking directive. Without this, /thinking
+    // only updated sysPrompt + disk while the in-memory system message (and
+    // thus the next chat request) stayed stale.
+    this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
     await this.save();
   }
 
@@ -402,11 +559,15 @@ export class Agent {
    * the agent only knows about its in-memory state.
    */
   async setSkillEnabled(name: string, enabled: boolean): Promise<boolean> {
+    if (this.running) {
+      throw new Error('cannot toggle skills while a turn is in flight — cancel first with Esc');
+    }
     if (!this.skills.has(name)) return false;
     const changed = this.skills.setDisabled(name, !enabled);
     if (!changed) return false;
     this.rebuildSystemPrompt();
     this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
     await this.save();
     return true;
   }
@@ -441,8 +602,10 @@ export class Agent {
    * in-flight chat already has its messages serialized).
    */
   rebuildFromSkills(): void {
+    this._lastRebuildKey = ''; // force because skills list changed externally
     this.rebuildSystemPrompt();
     this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
   }
 
   /**
@@ -466,10 +629,16 @@ export class Agent {
       throw new Error(`skill "${name}" is disabled — enable it from /skills first`);
     }
     const body = materializeSkillBody(s);
-    this.history.push({
-      role: 'system',
-      content: `The user invoked /${name}. Apply this skill to the next request:\n\n${body}`,
-    });
+    // role: 'user', not 'system' — this is appended into `this.history`
+    // permanently (unlike the per-turn context folded into the system
+    // message in runInner), and some locally-served models' chat templates
+    // hard-error on any system-role message that isn't the very first one.
+    const skillNote = {
+      role: 'user' as const,
+      content: `[/${name} invoked] Apply this skill to the next request:\n\n${body}`,
+    };
+    this.history.push(skillNote);
+    this.tokens.accountForPush(skillNote);
     // Track as active so the allowed-tools enforcer treats this skill as
     // loaded for the upcoming turn.
     this.pendingSkills.add(name);
@@ -486,17 +655,34 @@ export class Agent {
    *      read_payloads, read_skill_file, coverage, ask, confirm_finding,
    *      file_read, glob, grep, web_fetch, web_search). These are
    *      workflow / observational and shouldn't be skill-gated.
-   *   3. Any active skill OMITS allowed-tools → no restriction. By
-   *      convention, an empty allowed-tools means "inherit all tools",
-   *      so an unrestricted active skill leaves the agent unrestricted.
+   *   3. ALL active skills OMIT allowed-tools → no restriction. By
+   *      convention, an empty allowed-tools means "inherit all tools" for
+   *      that skill — but this must not let one unrestricted skill erase a
+   *      DIFFERENT active skill's declared sandbox. If any active skill
+   *      declares an allowed-tools list, that restriction still binds:
+   *      a narrowly-scoped skill (allowed-tools: [http]) stays scoped even
+   *      when a second, unrestricted skill is active alongside it, so
+   *      loading a second skill can't be used to bypass the first one's
+   *      allowlist (including a skill suggested via prompt injection).
    *   4. Any active skill lists the tool in its `allowed-tools` →
-   *      allowed. (Union semantics: loading multiple skills broadens
-   *      what's allowed.)
+   *      allowed. (Union semantics: loading multiple *restricted* skills
+   *      broadens what's allowed among their declared lists.)
    *   5. Else → blocked, with a message naming the active skills and the
    *      tools each allows, so the model knows what to do (load a
    *      different skill, or give up on the disallowed action).
    */
   private isToolAllowed(toolName: string): { ok: boolean; reason?: string } {
+    // Plan mode: read-only / observational tools only (Claude Code plan-mode style).
+    if (this.planMode && !isExploreAllowedTool(toolName)) {
+      const t = this.tools.get(toolName);
+      // Still allow no-permission workflow tools (todo, load_skill, ask, …).
+      if (t?.requiresPermission()) {
+        return {
+          ok: false,
+          reason: `tool "${toolName}" is blocked in plan mode. Exit plan mode with /plan off (or /act) before using mutating tools.`,
+        };
+      }
+    }
     if (this.activeSkills.size === 0) return { ok: true };
     const t = this.tools.get(toolName);
     if (!t) return { ok: true }; // unknown tool — let downstream fail with a clearer error
@@ -504,10 +690,10 @@ export class Agent {
     const activeSkills = [...this.activeSkills]
       .map((n) => this.skills.get(n))
       .filter((s): s is NonNullable<typeof s> => s !== undefined);
-    // No resolvable active skill, or any active skill that omits
-    // allowed-tools → unrestricted (omit = inherit all tools).
+    // No resolvable active skill, or EVERY active skill omits allowed-tools
+    // (none of them declared a sandbox) → unrestricted.
     if (activeSkills.length === 0) return { ok: true };
-    if (activeSkills.some((s) => s.tools.length === 0)) return { ok: true };
+    if (activeSkills.every((s) => s.tools.length === 0)) return { ok: true };
     // pentesterflow registers tools under two names (Unix and
     // PascalCase — `shell` AND `BashTool`, `file_write` AND
     // `FileWriteTool`, etc.) so models trained against either corpus
@@ -533,36 +719,26 @@ export class Agent {
   }
 
   approxTokens(): number {
-    let total = 0;
-    for (const m of this.history) {
-      total += Math.floor(m.content.length / 4);
-      for (const tc of m.toolCalls ?? []) {
-        total += Math.floor((tc.function.name.length + tc.function.arguments.length) / 4);
-      }
-    }
-    return total;
+    return this.tokens.approxTokens();
   }
 
-  /**
-   * Token estimate for the tool JSON schemas attached to every tool-enabled
-   * request (req.tools). approxTokens() deliberately counts only history so the
-   * StatusBar reading stays stable, but the auto-compact gate must include this
-   * (~2–5k tokens) or it under-counts the real request size and lets the window
-   * overflow. Cached and recomputed only when the tool count changes.
-   */
-  private toolsTokenEstimate(): number {
-    const count = this.tools.names().length;
-    if (count !== this.toolsTokensKey) {
-      this.toolsTokensCache = Math.floor(JSON.stringify(this.tools.asLLMTools()).length / 4);
-      this.toolsTokensKey = count;
-    }
-    return this.toolsTokensCache;
+  /** History + tool-schema estimate — the same baseline the auto-compact
+   *  gate checks against (gate adds the incoming message on top; that part
+   *  is turn-specific and unknown at rest). Callers displaying "how full is
+   *  context" (StatusBar) must use this, not approxTokens() alone, or the
+   *  bar reads "room left" while the next turn already crosses the gate. */
+  contextTokens(): number {
+    return this.tokens.approxTokens() + this.tokens.toolsTokenEstimate(this.tools);
   }
 
   // ---------- session lifecycle ----------
 
   async reset(): Promise<void> {
+    if (this.running) {
+      throw new Error('cannot reset while a turn is in flight — cancel first with Esc');
+    }
     this.history = [{ role: 'system', content: this.sysPrompt }];
+    this.tokens.recompute(this.history);
     this.memory = null;
     // A reset wipes the conversation; allowed-tools restrictions from
     // previously-loaded skills should go too, otherwise the user is
@@ -590,27 +766,42 @@ export class Agent {
     const loaded = this.store.load();
     if (loaded.target) this.target.copyFrom(loaded.target);
     this.memory = loaded.memory;
+    this._lastRebuildKey = '';
     this.rebuildSystemPrompt();
     if (loaded.messages.length === 0) {
       this.history = [{ role: 'system', content: this.sysPrompt }];
+      // rebuildSystemPrompt() just above can change this.sysPrompt's size
+      // (loaded target/memory affect it) — without recomputing here, the
+      // status bar and auto-compact gate keep sizing against the
+      // pre-resume prompt until the next turn happens to trigger a recompute.
+      this.tokens.recompute(this.history);
       return;
     }
     // Repair any dangling tool_calls a prior session aborted mid-loop, else
     // the first resumed request 400s on an unanswered call (H6).
     this.history = reconcileToolCalls(ensureSystemPrompt(loaded.messages, this.sysPrompt));
+    this.tokens.recompute(this.history);
   }
 
   async setTargetBaseURL(u: string): Promise<void> {
+    if (this.running) {
+      throw new Error('cannot change target while a turn is in flight — cancel first with Esc');
+    }
     this.target.setBaseURL(u);
     this.rebuildSystemPrompt();
     this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
     await this.save();
   }
 
   async clearTarget(): Promise<void> {
+    if (this.running) {
+      throw new Error('cannot clear target while a turn is in flight — cancel first with Esc');
+    }
     this.target.clear();
     this.rebuildSystemPrompt();
     this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
     await this.save();
   }
 
@@ -661,10 +852,16 @@ export class Agent {
           },
         ],
       };
-      const resp = await this.client.chat(req, signal);
+      const resp = await this.client.chat(req, signal, this.onRetryHook(safeEmit));
+      this.tokens.accountUsage(resp.usage);
       const summary = stripThinkingTags(resp.message.content);
       if (!summary) {
-        safeEmit({ type: 'error', err: new Error('compact returned empty summary') });
+        safeEmit({
+          type: 'error',
+          err: new Error(
+            'compact produced an empty summary (the model may have spent the whole reply on thinking) — try /compact again or /clear to reset context',
+          ),
+        });
         return;
       }
       this.memory = mergeMemory(this.memory, summary);
@@ -677,20 +874,33 @@ export class Agent {
       // tripped — otherwise it stays disabled for the whole process (M4).
       this.consecutiveCompactFailures = 0;
       await this.learnIntelligence(summary);
+      const pinned = formatPinnedMemory(this.memory);
       this.history = [
         { role: 'system', content: this.sysPrompt },
         {
           role: 'user',
-          content: `Session context was compacted. Continue from this summary:\n\n${summary}`,
+          content: [
+            'Session context was compacted (tool spam microcompacted, then summarized).',
+            'Continue from pinned state + summary.',
+            pinned ? `\n${pinned}\n` : '',
+            `\n## Compact summary\n\n${summary}`,
+          ].join('\n'),
         },
       ];
+      this.tokens.recompute(this.history);
       await this.save().catch((err) =>
         safeEmit({ type: 'error', err: new Error(`save compacted session: ${errMessage(err)}`) }),
       );
       await this.saveContextSnapshot('manual compact').catch((err) =>
         safeEmit({ type: 'error', err: new Error(`save context snapshot: ${errMessage(err)}`) }),
       );
-      safeEmit({ type: 'compact', summary, memoryItems: countMemoryItems(this.memory) });
+      // UI gets a short notice only — the full summary lives in history for
+      // the model, not as a wall of system text in the transcript.
+      safeEmit({
+        type: 'compact',
+        summary: 'Context compacted',
+        memoryItems: countMemoryItems(this.memory),
+      });
     } catch (err) {
       logError('agent: panic in Compact', { err: errMessage(err) });
       safeEmit({ type: 'error', err: err instanceof Error ? err : new Error(String(err)) });
@@ -717,11 +927,12 @@ export class Agent {
     // (and the next save) can't carry an unanswered tool call into a provider
     // 400 (H6).
     this.history = reconcileToolCalls(this.history);
+    this.tokens.recompute(this.history);
 
     // Expand @file mentions once. The expanded text is both what we size this
     // turn against for the auto-compact gate (M5 — a large @file attachment
     // must count toward the threshold) and the content actually sent below.
-    const expandedUserMsg = expandFileMentions(userMsg);
+    const expandedUserMsg = opts?.expandMentions === false ? userMsg : expandFileMentions(userMsg);
     // content.length/4 (UTF-16 units) to match approxTokens()'s estimator — the
     // two are summed in the gate below, so they must use the same unit.
     const incomingTokens = Math.floor(expandedUserMsg.length / 4);
@@ -729,57 +940,78 @@ export class Agent {
     // Auto-compact gate. Run BEFORE we add the new user message so the
     // compaction summary doesn't include this turn's question — the
     // user expects their prompt to be answered, not summarized away.
-    // Includes the incoming (post-expansion) message size so a near-threshold
-    // turn plus a large attachment can't blow past the context window with no
-    // compaction (M5), and the tool-schema size (req.tools) which is sent on
-    // every tool-enabled request but isn't part of the history approxTokens()
-    // counts. Circuit breaker: stop retrying if we've failed N times in a row;
-    // the user can still call /compact manually to investigate.
-    const toolsTokens = opts?.tools === false ? 0 : this.toolsTokenEstimate();
+    // baseline is contextTokens() (history + tool-schema estimate — the same
+    // number StatusBar displays) plus the incoming (post-expansion) message
+    // size, so a near-threshold turn plus a large attachment can't blow past
+    // the context window with no compaction (M5). Circuit breaker: stop
+    // retrying if we've failed N times in a row; the user can still call
+    // /compact manually to investigate.
+    const baseline = opts?.tools === false ? this.approxTokens() : this.contextTokens();
     if (
       this.autoCompactThreshold > 0 &&
       this.consecutiveCompactFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES &&
-      this.approxTokens() + incomingTokens + toolsTokens >= this.autoCompactThreshold
+      baseline + incomingTokens >= this.autoCompactThreshold
     ) {
       await this.autoCompact(signal, emit);
     }
 
-    const decision =
-      opts?.tools === false
-        ? undefined
-        : buildDecisionPlan(userMsg, this.skills.listEnabled(), this.target);
-    if (decision) {
-      if (decision.recommendedSkill) {
-        emit({
-          type: 'decision',
-          summary: `decision planner: selected skill: ${decision.recommendedSkill} · risk: ${decision.risk} · ${decision.reason}`,
-        });
-      }
-    }
-
     // Persist the raw user message (un-expanded mentions) so the on-disk
     // session doesn't leak file contents the user inlined via @path.
-    this.history.push({ role: 'user', content: userMsg });
+    const userMsgObj = { role: 'user' as const, content: userMsg };
+    this.history.push(userMsgObj);
+    this.tokens.accountForPush(userMsgObj);
+    // Best-effort — a provider write failure must never break the turn.
+    // Redact before handing content to external memory providers (mem0,
+    // honcho, etc.) — unlike the local stores (intelligence/curatedMemory/
+    // userProfile), these ship the raw text over the network to a
+    // third-party service, so a live secret the agent echoes mid-engagement
+    // must never reach record() unredacted.
+    void this.memoryProvider
+      ?.record({ role: 'user', content: redact(userMsg), createdAt: new Date().toISOString() })
+      .catch(() => undefined);
     const working = this.history.map((m) => ({ ...m }));
     await this.save().catch((err) =>
-      emit({ type: 'error', err: new Error(`save session: ${errMessage(err)}`) }),
+      emit({
+        type: 'error',
+        err: new Error(
+          `⚠ failed to save session — progress may be lost on restart: ${errMessage(err)}`,
+        ),
+      }),
     );
 
     const last = working[working.length - 1];
-    if (decision && last) {
-      working.splice(working.length - 1, 0, { role: 'system', content: decision.guidance });
+    // Fold per-turn context (skill route, learned-scenario recall, curated-memory
+    // recall) into the existing system message at index 0 rather than splicing
+    // extra role:'system' entries mid-transcript. Some locally-served models
+    // (Ollama, LM Studio, vLLM) apply the GGUF's own Jinja chat template, and
+    // templates that enforce "system message must be first" hard-error on a
+    // second system-role message appearing later in the array — this keeps
+    // exactly one system message, always first, on every backend.
+    const extraSystemContext: string[] = [];
+    if (opts?.tools !== false) {
+      const route = routeSkill(userMsg, this.skills.listEnabled(), this.target);
+      if (route) {
+        emit({ type: 'decision', summary: route.summary });
+        extraSystemContext.push(route.guidance);
+      }
     }
     const intelligenceContext = this.buildIntelligenceContext(userMsg);
-    if (intelligenceContext && last) {
-      working.splice(working.length - 1, 0, { role: 'system', content: intelligenceContext });
-    }
-    // Recall the durable curated facts most relevant to this turn and inject
-    // their full text just before the user message, so they stay in context
-    // even after a compaction has scrubbed the transcript (the catalog of names
-    // is already pinned in the system prompt; this brings in the bodies).
+    if (intelligenceContext) extraSystemContext.push(intelligenceContext);
+    // Recall the durable curated facts most relevant to this turn so they
+    // stay in context even after a compaction has scrubbed the transcript
+    // (the catalog of names is already pinned in the system prompt; this
+    // brings in the bodies).
     const recall = this.recallCuratedMemory(userMsg, emit);
-    if (recall && last) {
-      working.splice(working.length - 1, 0, { role: 'system', content: recall });
+    if (recall) extraSystemContext.push(recall);
+    if (this.memoryProvider) {
+      const status = this.memoryProvider.systemPromptContext();
+      if (status) extraSystemContext.push(status);
+      const providerRecall = await this.memoryProvider.recall(userMsg).catch(() => '');
+      if (providerRecall) extraSystemContext.push(providerRecall);
+    }
+    const system = working[0];
+    if (extraSystemContext.length > 0 && system) {
+      working[0] = { ...system, content: [system.content, ...extraSystemContext].join('\n\n') };
     }
     if (last) last.content = expandedUserMsg;
 
@@ -812,7 +1044,15 @@ export class Agent {
       }
 
       this.history.push(resp.message);
+      this.tokens.accountForPush(resp.message);
       working.push(resp.message);
+      void this.memoryProvider
+        ?.record({
+          role: 'assistant',
+          content: redact(resp.message.content),
+          createdAt: new Date().toISOString(),
+        })
+        .catch(() => undefined);
       await this.save().catch((err) =>
         emit({ type: 'error', err: new Error(`save session: ${errMessage(err)}`) }),
       );
@@ -831,7 +1071,17 @@ export class Agent {
         return;
       }
 
-      await this.executeToolCalls(toolCalls, signal, emit, working);
+      const toolOutcomes = await this.executeToolCalls(toolCalls, signal, emit, working);
+      // Lightweight OBSERVE: when tools failed (or many succeeded), fold a
+      // short note into the system message so the next step doesn't blindly
+      // repeat the same call — especially important for small local models.
+      const observe = buildObserveNote(toolOutcomes);
+      if (observe && working[0]) {
+        working[0] = {
+          ...working[0],
+          content: `${working[0].content}\n\n${observe}`,
+        };
+      }
     }
     emit({ type: 'error', err: new MaxStepsError(maxSteps) });
   }
@@ -847,7 +1097,7 @@ export class Agent {
    * next compaction. Emits an informational event so the user sees it happened.
    */
   private guardWorkingContext(working: Message[], emit: EventSink, opts?: AgentRunOptions): void {
-    const toolsTokens = opts?.tools === false ? 0 : this.toolsTokenEstimate();
+    const toolsTokens = opts?.tools === false ? 0 : this.tokens.toolsTokenEstimate(this.tools);
     const size = (): number => {
       let total = toolsTokens;
       for (const m of working) {
@@ -884,51 +1134,70 @@ export class Agent {
     if (dropped > 0) {
       emit({
         type: 'decision',
-        summary: `context guard: elided ${dropped} bytes of older tool output mid-turn to fit the context window`,
+        summary: `context · elided ${dropped} bytes of older tool output mid-turn`,
       });
     }
   }
 
   /**
-   * Run the step's tool calls. A single call, or any step containing a
-   * state-mutating tool (load_skill), runs sequentially with the original
-   * interleaved tool-call/tool-result emit order and a single save after the
-   * loop. Multiple
-   * independent calls run with bounded concurrency (E1): all tool-call events
-   * are emitted in order, the calls execute concurrently, then results are
-   * emitted and tool messages recorded in the original order so the
-   * transcript and the provider's tool_call→result pairing stay deterministic
-   * regardless of completion order.
+   * Run the step's tool calls. Returns per-tool outcomes for the observe step.
+   * A single call, or any step containing a state-mutating tool (load_skill),
+   * runs sequentially; independent calls run with bounded concurrency (E1).
    */
   private async executeToolCalls(
     toolCalls: ToolCall[],
     signal: AbortSignal,
     emit: EventSink,
     working: Message[],
-  ): Promise<void> {
+  ): Promise<Array<{ name: string; err: string; result: string }>> {
+    const outcomes: Array<{ name: string; err: string; result: string }> = [];
     const sequential =
-      toolCalls.length <= 1 || toolCalls.some((tc) => STATEFUL_TOOLS.has(tc.function.name));
+      toolCalls.length <= 1 ||
+      toolCalls.some((tc) => STATEFUL_TOOLS.has(canonicalToolName(tc.function.name)));
 
     if (sequential) {
-      for (const tc of toolCalls) {
-        if (signal.aborted) throw new Error('aborted');
-        const parsed = this.parseToolCall(tc);
-        emit({
-          type: 'tool-call',
-          id: tc.id,
-          name: tc.function.name,
-          args: parsed.args,
-          argsJSON: parsed.argsJSON,
-        });
-        const res = await this.runParsedToolCall(tc, parsed, signal);
-        this.recordToolResult(tc, parsed, res, emit, working);
+      // Track which calls already got a tool message so an abort mid-batch can
+      // synthesize ERROR results for the rest (keeps history valid for the next
+      // chat/resume without waiting for reconcileToolCalls on the next run).
+      const answered = new Set<string>();
+      const started = new Set<string>();
+      let aborted = false;
+      try {
+        for (const tc of toolCalls) {
+          if (signal.aborted) {
+            aborted = true;
+            break;
+          }
+          const parsed = this.parseToolCall(tc);
+          emit({
+            type: 'tool-call',
+            id: tc.id,
+            name: tc.function.name,
+            args: parsed.args,
+            argsJSON: parsed.argsJSON,
+          });
+          started.add(tc.id ?? '');
+          const res = await this.runParsedToolCall(tc, parsed, signal);
+          this.recordToolResult(tc, parsed, res, emit, working);
+          outcomes.push({ name: tc.function.name, err: res.errStr, result: res.result });
+          answered.add(tc.id ?? '');
+          if (signal.aborted) {
+            aborted = true;
+            break;
+          }
+        }
+      } finally {
+        // Fill unanswered slots so assistant tool_calls never dangle on disk.
+        this.synthesizeUnansweredToolResults(toolCalls, answered, started, emit, working);
       }
       // One save after the loop — matches the parallel branch and avoids a
-      // full-session write after every tool result.
+      // full-session write after every tool result. Always save after synth so
+      // an aborted batch is durable before we rethrow.
       await this.save().catch((err) =>
         emit({ type: 'error', err: new Error(`save session: ${errMessage(err)}`) }),
       );
-      return;
+      if (aborted) throw new Error('aborted');
+      return outcomes;
     }
 
     const parsedAll = toolCalls.map((tc) => this.parseToolCall(tc));
@@ -950,13 +1219,60 @@ export class Agent {
     toolCalls.forEach((tc, i) => {
       const parsed = parsedAll[i];
       const res = results[i];
-      if (parsed && res) this.recordToolResult(tc, parsed, res, emit, working);
+      if (parsed && res) {
+        this.recordToolResult(tc, parsed, res, emit, working);
+        outcomes.push({ name: tc.function.name, err: res.errStr, result: res.result });
+      }
     });
     // One save covers the whole batch — every tool message is appended above.
     await this.save().catch((err) =>
-      emit({ type: 'error', err: new Error(`save session: ${errMessage(err)}`) }),
+      emit({
+        type: 'error',
+        err: new Error(
+          `⚠ failed to save session — progress may be lost on restart: ${errMessage(err)}`,
+        ),
+      }),
     );
     if (signal.aborted) throw new Error('aborted');
+    return outcomes;
+  }
+
+  /**
+   * Append ERROR tool results for any tool_call ids not yet answered. Used when
+   * a sequential batch is aborted mid-loop so history stays valid immediately
+   * (not only after the next runInner reconcile).
+   */
+  private synthesizeUnansweredToolResults(
+    toolCalls: ToolCall[],
+    answered: Set<string>,
+    started: Set<string>,
+    emit: EventSink,
+    working: Message[],
+  ): void {
+    for (const tc of toolCalls) {
+      const id = tc.id ?? '';
+      if (answered.has(id)) continue;
+      const parsed = this.parseToolCall(tc);
+      const res: ToolCallResult = {
+        result:
+          'ERROR: tool call did not complete (the turn was interrupted before this tool produced a result).',
+        errStr: 'aborted',
+        durationMs: 0,
+      };
+      // Only emit tool-call if we never started this call (avoid double UI rows
+      // when abort hit mid-run after the call was already shown).
+      if (!started.has(id)) {
+        emit({
+          type: 'tool-call',
+          id: tc.id,
+          name: tc.function.name,
+          args: parsed.args,
+          argsJSON: parsed.argsJSON,
+        });
+      }
+      this.recordToolResult(tc, parsed, res, emit, working);
+      answered.add(id);
+    }
   }
 
   /** Parse a tool call's JSON arguments, capturing (not throwing) a parse error
@@ -984,9 +1300,17 @@ export class Agent {
     const start = Date.now();
     let result = '';
     let runErr: Error | undefined;
+    // Only true once this.tools.execute() actually ran — a parse error, an
+    // allowed-tools block, or a pre-tool-call veto never reach it, so
+    // post-tool-call hooks (which fire below) skip those cases.
+    let executed = false;
     if (parsed.parseErr) {
+      // Cap the echoed raw JSON so a huge malformed args blob doesn't flood the
+      // transcript / model context; the message is just a self-correct hint.
+      const rawPreview =
+        parsed.argsJSON.length > 200 ? `${parsed.argsJSON.slice(0, 200)}…` : parsed.argsJSON;
       runErr = new Error(
-        `could not parse arguments: ${parsed.parseErr.message} (raw: ${parsed.argsJSON})`,
+        `could not parse arguments: ${parsed.parseErr.message} (raw: ${rawPreview})`,
       );
     } else {
       // Enforce the active skills' allowed-tools union before dispatch.
@@ -999,10 +1323,25 @@ export class Agent {
       if (!allowed.ok) {
         runErr = new Error(allowed.reason ?? 'tool blocked by active skills');
       } else {
-        try {
-          result = await this.tools.execute(tc.function.name, parsed.args, signal, this.prompter);
-        } catch (err) {
-          runErr = err instanceof Error ? err : new Error(String(err));
+        const veto =
+          this.hookConfig.length > 0
+            ? await runToolHooks(
+                'pre-tool-call',
+                tc.function.name,
+                { EVENT: 'pre-tool-call', TOOL: tc.function.name, ARGS: parsed.argsJSON },
+                this.hookConfig,
+                signal,
+              )
+            : { blocked: false };
+        if (veto.blocked) {
+          runErr = new Error(veto.message ?? 'blocked by pre-tool-call hook');
+        } else {
+          executed = true;
+          try {
+            result = await this.tools.execute(tc.function.name, parsed.args, signal, this.prompter);
+          } catch (err) {
+            runErr = err instanceof Error ? err : new Error(String(err));
+          }
         }
       }
     }
@@ -1017,6 +1356,24 @@ export class Agent {
         err: errStr,
       });
     }
+    // Fire-and-forget: post-tool-call hooks never block the turn or fail the
+    // call. Skips the pre-tool-call-veto/allowed-tools-block cases since
+    // those never actually invoked the tool (executed stays false).
+    if (this.hookConfig.length > 0 && executed) {
+      void runToolHooks(
+        'post-tool-call',
+        tc.function.name,
+        {
+          EVENT: 'post-tool-call',
+          TOOL: tc.function.name,
+          ARGS: parsed.argsJSON,
+          RESULT: result.length > 2000 ? `${result.slice(0, 2000)}…` : result,
+          ERROR: errStr,
+        },
+        this.hookConfig,
+        signal,
+      );
+    }
     return { result, errStr, durationMs };
   }
 
@@ -1029,6 +1386,7 @@ export class Agent {
     emit: EventSink,
     working: Message[],
   ): void {
+    // UI / transcript get the full body (collapse handled in the TUI).
     emit({
       type: 'tool-result',
       id: tc.id,
@@ -1044,20 +1402,59 @@ export class Agent {
 
     if (tc.function.name === 'load_skill' && !res.errStr) {
       const nm = typeof parsed.args.name === 'string' ? parsed.args.name : '';
-      if (nm) {
+      // Forked skill runs already applied the playbook in the child — only
+      // activate allowlists when we actually injected the skill body here.
+      const forked = parsed.args.fork === true;
+      if (nm && !forked) {
         this.activeSkills.add(nm);
         emit({ type: 'skill-active', name: nm });
       }
     }
 
+    if (tc.function.name === 'todo' && !res.errStr) {
+      emit({ type: 'todo', items: this.getTodos() });
+    }
+
+    // LLM history gets a short preview when the body is huge; full text is
+    // written under the session dir (tool-results/) for file_read if needed.
+    const sessionDir = this.store?.path ? dirname(this.store.path) : null;
+    const off = maybeOffloadToolResult(sessionDir, tc.id, tc.function.name, res.result);
+    if (off.offloaded) {
+      emit({
+        type: 'decision',
+        summary: `context · offloaded ${res.result.length} chars of ${tc.function.name} output to disk`,
+      });
+    }
+
     const toolMsg: Message = {
       role: 'tool',
-      content: res.result,
+      content: off.forHistory,
       toolCallID: tc.id,
       name: tc.function.name,
     };
     this.history.push(toolMsg);
+    this.tokens.accountForPush(toolMsg);
     working.push(toolMsg);
+  }
+
+  /**
+   * Surfaces the backend's own retry-on-rate-limit/5xx backoff to the user
+   * instead of it being a silent multi-second pause — same idea as Claude
+   * Code / Codex showing "retrying…" rather than looking hung or just
+   * barreling on. The client still owns whether/how many times it retries;
+   * this only makes an already-happening wait visible. Shared by every
+   * client.chat()/chatStream() call site (the turn loop, /compact, and
+   * auto-compact) so none of them silently swallow a retry.
+   */
+  private onRetryHook(emit: EventSink): (info: RetryInfo) => void {
+    return (info) => {
+      emit({
+        type: 'retry',
+        attempt: info.attempt,
+        delayMs: info.delayMs,
+        message: errMessage(info.err),
+      });
+    };
   }
 
   private async chat(
@@ -1065,6 +1462,7 @@ export class Agent {
     signal: AbortSignal,
     emit: EventSink,
   ): Promise<{ resp: Awaited<ReturnType<Client['chat']>>; streamed: boolean }> {
+    const onRetry = this.onRetryHook(emit);
     if (this.streamingEnabled && isStreaming(this.client)) {
       const c: StreamingClient = this.client;
       // Strip thinking-block content from the live stream so a local model's
@@ -1080,12 +1478,15 @@ export class Agent {
           if (visible) emit({ type: 'assistant-delta', text: visible });
         },
         signal,
+        onRetry,
       );
       const tail = filter.flush();
       if (tail) emit({ type: 'assistant-delta', text: tail });
+      this.tokens.accountUsage(resp.usage);
       return { resp, streamed: true };
     }
-    const resp = await this.client.chat(req, signal);
+    const resp = await this.client.chat(req, signal, onRetry);
+    this.tokens.accountUsage(resp.usage);
     return { resp, streamed: false };
   }
 
@@ -1100,27 +1501,34 @@ export class Agent {
    * we return.
    */
   private async autoCompact(signal: AbortSignal, emit: EventSink): Promise<void> {
+    // Claude/Grok-style: one quiet success notice after the work, no
+    // "triggered…" progress line that doubles the transcript noise.
     const tokensBefore = this.approxTokens();
-    emit({
-      type: 'compact',
-      summary: `auto-compact triggered (~${tokensBefore} tokens ≥ threshold ${this.autoCompactThreshold})…`,
-      tokensBefore,
-    });
 
     let compactionSucceeded = false;
     try {
-      await this.compactInPlace(signal);
+      await this.compactInPlace(signal, emit);
       compactionSucceeded = true;
     } catch (err) {
+      // A user cancellation (Esc) mid-compact throws the same AbortError
+      // shape as a genuine compaction bug — without this check it counted
+      // toward the same circuit breaker, so three legitimate cancellations
+      // in a row could permanently disable auto-compact for the rest of the
+      // session even though nothing about compaction itself is broken.
+      if (signal.aborted || isAbortLikeError(err)) throw err;
       this.consecutiveCompactFailures += 1;
       logError('agent: auto-compact failed', {
         err: errMessage(err),
         consecutive: this.consecutiveCompactFailures,
       });
+      const disabled =
+        this.consecutiveCompactFailures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
+          ? ' — auto-compact now DISABLED for this session; context may overflow. Use /clear or /compact to recover.'
+          : '';
       emit({
         type: 'error',
         err: new Error(
-          `auto-compact failed (${this.consecutiveCompactFailures}/${MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES}): ${errMessage(err)}`,
+          `auto-compact failed (${this.consecutiveCompactFailures}/${MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES}): ${errMessage(err)}${disabled}`,
         ),
       });
     }
@@ -1130,7 +1538,7 @@ export class Agent {
       const tokensAfter = this.approxTokens();
       emit({
         type: 'compact',
-        summary: `auto-compacted: ~${tokensBefore} → ~${tokensAfter} tokens`,
+        summary: 'Context compacted',
         tokensBefore,
         tokensAfter,
         memoryItems: countMemoryItems(this.memory),
@@ -1143,9 +1551,11 @@ export class Agent {
    * the public compact() does. Sends the current history to the model
    * with a summarize-prompt, replaces history with [system, summary]
    * on success. Throws on any error so autoCompact can update the
-   * failure counter.
+   * failure counter. `emit`, when given, still surfaces a mid-wait retry
+   * notice (see onRetryHook) — "no ceremony" means no progress narration,
+   * not that a stalled network retry stays invisible.
    */
-  private async compactInPlace(signal: AbortSignal): Promise<void> {
+  private async compactInPlace(signal: AbortSignal, emit?: EventSink): Promise<void> {
     const historySnap = this.history.slice();
     if (historySnap.length <= 1) return;
     const req: ChatRequest = {
@@ -1161,28 +1571,64 @@ export class Agent {
         },
       ],
     };
-    const resp = await this.client.chat(req, signal);
+    const resp = await this.client.chat(req, signal, emit ? this.onRetryHook(emit) : undefined);
+    this.tokens.accountUsage(resp.usage);
     const summary = stripThinkingTags(resp.message.content);
     if (!summary) {
-      throw new Error('compact returned empty summary');
+      throw new Error(
+        'compact produced an empty summary (the model may have spent the whole reply on thinking)',
+      );
     }
     this.memory = mergeMemory(this.memory, summary);
     // Fold the merged checkpoint into the system prompt before seeding the
     // reset history, so cumulative state (not just this summary) rides forward.
     this.rebuildSystemPrompt();
     await this.learnIntelligence(summary);
+    const pinned = formatPinnedMemory(this.memory);
     this.history = [
       { role: 'system', content: this.sysPrompt },
       {
         role: 'user',
-        content: `Session context was compacted. Continue from this summary:\n\n${summary}`,
+        content: [
+          'Session context was compacted (tool spam microcompacted, then summarized).',
+          'Continue from pinned state + summary.',
+          pinned ? `\n${pinned}\n` : '',
+          `\n## Compact summary\n\n${summary}`,
+        ].join('\n'),
       },
     ];
+    this.tokens.recompute(this.history);
     await this.save();
     await this.saveContextSnapshot('auto compact');
   }
 
+  // Last seen values to avoid pointless rebuilds of (potentially large) system prompt string.
+  private _lastRebuildKey = '';
+
   private rebuildSystemPrompt(): void {
+    const curated = this.memoryStore?.index() ?? '';
+    const userProfile = this.userProfileStore?.load() ?? '';
+    // Include enabled skill names so skill enable/disable forces a rebuild of
+    // the advertised skills section.
+    const skillNames = this.skills
+      .listEnabled()
+      .map((s) => s.name)
+      .join(',');
+    // Cheap key: changes to these drive visible prompt differences.
+    const key = [
+      this.thinking ? 't1' : 't0',
+      this.toolingProfile,
+      this.promptProfile,
+      this.target.baseURL() || '',
+      this.target.name() || '',
+      this.engagement || '',
+      curated,
+      userProfile,
+      this.memory ? `${this.memory.compactions}:${this.memory.updatedAt}` : 'nomem',
+      skillNames,
+    ].join('|');
+    if (key === this._lastRebuildKey) return;
+    this._lastRebuildKey = key;
     this.sysPrompt = buildSystemPrompt({
       skills: this.skills,
       thinkingEnabled: this.thinking,
@@ -1191,7 +1637,8 @@ export class Agent {
       promptProfile: this.promptProfile,
       memory: this.memory,
       engagement: this.engagement,
-      curatedMemory: this.memoryStore?.index() ?? '',
+      curatedMemory: curated,
+      userProfile,
     });
   }
 
@@ -1207,11 +1654,15 @@ export class Agent {
    * Returns the stored fact, or null when there's no store or the text is empty.
    */
   async addMemory(input: AddMemoryInput): Promise<MemoryFact | null> {
+    if (this.running) {
+      throw new Error('cannot save memory while a turn is in flight — cancel first with Esc');
+    }
     if (!this.memoryStore) return null;
     const fact = this.memoryStore.add(input);
     if (!fact) return null;
     this.rebuildSystemPrompt();
     this.history = ensureSystemPrompt(this.history, this.sysPrompt);
+    this.tokens.recompute(this.history);
     await this.save();
     return fact;
   }
@@ -1297,9 +1748,13 @@ export function reconcileToolCalls(messages: Message[]): Message[] {
       if (next.toolCallID) answered.add(next.toolCallID);
       out.push(next);
     }
-    // Synthesize a result for any call the aborted turn never answered.
+    // Synthesize a result for any call the aborted turn never answered. Also
+    // repairs a call with a missing/empty id (some providers can emit this on
+    // malformed output) — the `tc.id &&` guard this used to have meant exactly
+    // that case, the one this function exists to fix, fell straight through
+    // unrepaired and still provoked the H6 400 on the next resumed request.
     for (const tc of m.toolCalls) {
-      if (tc.id && !answered.has(tc.id)) {
+      if (!answered.has(tc.id ?? '')) {
         out.push({
           role: 'tool',
           content:
@@ -1312,177 +1767,6 @@ export function reconcileToolCalls(messages: Message[]): Message[] {
     i = j - 1;
   }
   return out;
-}
-
-function buildTurnLearningText(userMsg: string, assistantMsg: string): string {
-  return [
-    '## User preferences and working style',
-    userMsg,
-    '',
-    '## Task outcome',
-    assistantMsg,
-  ].join('\n');
-}
-
-function emptyMemory(): SessionMemory {
-  const now = new Date().toISOString();
-  return {
-    version: 1,
-    updatedAt: now,
-    compactions: 0,
-    objectives: [],
-    plan: [],
-    completed: [],
-    findings: [],
-    tested: [],
-    files: [],
-    commands: [],
-    credentials: [],
-    todos: [],
-  };
-}
-
-function mergeMemory(prev: SessionMemory | null, summary: string): SessionMemory {
-  const now = new Date().toISOString();
-  const parsed = parseCompactionSummary(summary);
-  return {
-    ...(prev ?? emptyMemory()),
-    updatedAt: now,
-    lastCompactedAt: now,
-    lastSummary: summary,
-    compactions: (prev?.compactions ?? 0) + 1,
-    objectives: mergeList(prev?.objectives, parsed.objectives),
-    plan: mergeList(prev?.plan, parsed.plan),
-    completed: mergeList(prev?.completed, parsed.completed),
-    findings: mergeList(prev?.findings, parsed.findings, MAX_MEMORY_LIST),
-    tested: mergeList(prev?.tested, parsed.tested),
-    files: mergeList(prev?.files, parsed.files),
-    commands: mergeList(prev?.commands, parsed.commands),
-    credentials: mergeList(prev?.credentials, parsed.credentials, MAX_MEMORY_LIST),
-    todos: mergeList(prev?.todos, parsed.todos),
-  };
-}
-
-function parseCompactionSummary(
-  summary: string,
-): Omit<
-  SessionMemory,
-  'version' | 'updatedAt' | 'compactions' | 'lastCompactedAt' | 'lastSummary'
-> {
-  const sections = splitMarkdownSections(summary);
-  return {
-    objectives: sectionItems(sections, ['current objective', 'target and scope']),
-    plan: sectionItems(sections, ['plan']),
-    completed: sectionItems(sections, ['completed tasks']),
-    findings: sectionItems(sections, ['findings and evidence']),
-    tested: sectionItems(sections, ['tested surface', 'decisions and assumptions']),
-    files: sectionItems(sections, ['files and commands']).filter((s) =>
-      /(?:^|[\s/])[\w.-]+\.\w+|\/|\\/.test(s),
-    ),
-    commands: sectionItems(sections, ['files and commands']).filter((s) =>
-      /`[^`]+`|\b(?:curl|npm|git|rg|python|node|ffuf|nuclei|sqlmap|httpx)\b/.test(s),
-    ),
-    credentials: sectionItems(sections, ['credentials and placeholders']),
-    todos: sectionItems(sections, ['open todos', 'next best actions']),
-  };
-}
-
-function splitMarkdownSections(text: string): Map<string, string[]> {
-  const sections = new Map<string, string[]>();
-  let current = 'summary';
-  for (const raw of text.replace(/\r\n/g, '\n').split('\n')) {
-    const heading = raw.match(/^#{1,3}\s+(.+?)\s*$/);
-    if (heading?.[1]) {
-      current = normalizeHeading(heading[1]);
-      if (!sections.has(current)) sections.set(current, []);
-      continue;
-    }
-    if (!sections.has(current)) sections.set(current, []);
-    sections.get(current)?.push(raw);
-  }
-  return sections;
-}
-
-function sectionItems(sections: Map<string, string[]>, names: string[]): string[] {
-  const out: string[] = [];
-  for (const name of names.map(normalizeHeading)) {
-    for (const line of sections.get(name) ?? []) {
-      const item = line.replace(/^\s*(?:[-*]|\d+[.)])\s+/, '').trim();
-      if (!item || /^none\b|^n\/a$/i.test(item)) continue;
-      out.push(item);
-    }
-  }
-  return out;
-}
-
-function normalizeHeading(s: string): string {
-  return s.toLowerCase().replace(/[:#]/g, '').trim();
-}
-
-function mergeList(prev: string[] | undefined, next: string[], cap = 24): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of [...(prev ?? []), ...next]) {
-    const clean = item.replace(/\s+/g, ' ').trim();
-    if (!clean) continue;
-    const key = clean.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(clean.length > 240 ? `${clean.slice(0, 239)}…` : clean);
-  }
-  return Number.isFinite(cap) ? out.slice(-cap) : out;
-}
-
-function countMemoryItems(memory: SessionMemory | null): number {
-  if (!memory) return 0;
-  return (
-    memory.objectives.length +
-    memory.plan.length +
-    memory.completed.length +
-    memory.findings.length +
-    memory.tested.length +
-    memory.files.length +
-    memory.commands.length +
-    memory.credentials.length +
-    memory.todos.length
-  );
-}
-
-function appendMemorySection(out: string[], title: string, items: string[]): void {
-  if (items.length === 0) return;
-  out.push('');
-  out.push(title);
-  for (const item of items.slice(-8)) out.push(`- ${item}`);
-}
-
-function formatHistoryForCompaction(messages: Message[]): string {
-  const lines: string[] = [];
-  for (const m of messages) {
-    if (!m.content && (!m.toolCalls || m.toolCalls.length === 0)) continue;
-    lines.push(`\n[${m.role}${m.name ? `:${m.name}` : ''}]`);
-    if (m.content) {
-      // Scrub credentials before they're sent back to the LLM as a
-      // summarization prompt. Tool output captured during the session
-      // frequently echoes bearer tokens / cloud keys.
-      lines.push(redact.apply(m.content));
-    }
-    for (const tc of m.toolCalls ?? []) {
-      lines.push(`tool_call ${tc.id} ${tc.function.name} ${redact.apply(tc.function.arguments)}`);
-    }
-  }
-  return lines.join('\n');
-}
-
-function boundedHistoryForCompaction(messages: Message[]): string {
-  const full = formatHistoryForCompaction(messages);
-  if (full.length <= COMPACTION_INPUT_CHAR_LIMIT) return full;
-  const tail = full.slice(-COMPACTION_INPUT_CHAR_LIMIT);
-  const boundary = tail.indexOf('\n[');
-  const trimmed = boundary > 0 ? tail.slice(boundary) : tail;
-  return [
-    `[system]\nOlder conversation text was omitted because the compaction input exceeded ${COMPACTION_INPUT_CHAR_LIMIT} characters. Preserve continuity from persistent memory and the newest visible context below.`,
-    trimmed,
-  ].join('\n');
 }
 
 /** Wrap the user-supplied event sink so signal-cancel never wedges callers. */

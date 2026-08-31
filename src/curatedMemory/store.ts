@@ -3,7 +3,12 @@
 // fact with frontmatter, plus a generated MEMORY.md index. Distinct from:
 //   - SessionMemory (auto compaction checkpoint — ephemeral per session)
 //   - IntelligenceStore (auto-extracted JSONL scenarios — machine-learned)
-// This layer is what the user reads, edits, and recalls.
+//   - MemoryProvider (../memoryProvider/) — an OPTIONAL external backend
+//     (mem0/honcho/etc.) that runs alongside this store, never instead of it
+// This layer is what the user reads, edits, and recalls. Directory is named
+// `curatedMemory` (not `memory`) specifically so it doesn't read as a sibling
+// of `memoryProvider` — the two are unrelated systems that happen to share a
+// word.
 //
 // Two scopes (mirrors EngagementStore / IntelligenceStore):
 //   - project:  ./.pentesterflow/memory/   (this engagement; commit with it)
@@ -13,13 +18,11 @@
 // rides in the system prompt on every request (survives compaction) and
 // search() recalls the full matching facts into each turn's context.
 
-import { randomBytes } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -79,6 +82,8 @@ export class MemoryStore {
   // to one parse until the directory changes. Writes invalidate explicitly,
   // since dir-mtime resolution can be too coarse to notice a same-tick change.
   private readonly scopeCache = new Map<MemoryScope, { mtimeMs: number; facts: MemoryFact[] }>();
+  // Combined sorted list cache (avoids repeated spread+sort on hot path).
+  private listCache: { pMtime: number; perMtime: number; facts: MemoryFact[] } | null = null;
 
   constructor(opts: MemoryStoreOptions = {}) {
     const cwd = resolve(opts.cwd ?? process.cwd());
@@ -93,8 +98,33 @@ export class MemoryStore {
 
   /** All facts across both scopes, newest first. Corrupt files are skipped. */
   list(): MemoryFact[] {
-    const facts = [...this.readScope('project'), ...this.readScope('personal')];
-    return facts.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const p = this.readScope('project');
+    const per = this.readScope('personal');
+    const pMtime = this._scopeMtime('project');
+    const perMtime = this._scopeMtime('personal');
+    if (
+      this.listCache &&
+      this.listCache.pMtime === pMtime &&
+      this.listCache.perMtime === perMtime
+    ) {
+      return this.listCache.facts;
+    }
+    const facts = [...p, ...per].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    this.listCache = { pMtime, perMtime, facts };
+    return facts;
+  }
+
+  private _scopeMtime(scope: MemoryScope): number {
+    const cached = this.scopeCache.get(scope);
+    if (cached) return cached.mtimeMs;
+    // readScope will populate; fall back to stat if needed (rare)
+    const dir = this.dir(scope);
+    if (!existsSync(dir)) return 0;
+    try {
+      return statSync(dir).mtimeMs;
+    } catch {
+      return 0;
+    }
   }
 
   /**
@@ -112,12 +142,9 @@ export class MemoryStore {
     const dir = this.dir(scope);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
 
-    const name = this.uniqueName(dir, slugify(description) || 'note');
-    const file = join(dir, `${name}.md`);
-    const content = matter.stringify(`${text}\n`, { name, description, type, createdAt });
-    // Atomic write: tmp + rename so a crash mid-write can't corrupt or truncate
-    // the only copy of the fact (matches the session/config store pattern).
-    atomicWriteFileSync(file, content);
+    const { name, file } = this.writeUnique(dir, slugify(description) || 'note', (n) =>
+      matter.stringify(`${text}\n`, { name: n, description, type, createdAt }),
+    );
 
     const fact: MemoryFact = { name, description, type, scope, text, createdAt, file };
     // Re-read the scope once (the new file is now on disk) and reuse that single
@@ -160,6 +187,9 @@ export class MemoryStore {
   /** Compact catalog (names + descriptions) for always-on system-prompt
    *  injection. Empty string when there is nothing to advertise. */
   index(): string {
+    // Built from list() each call (cheap over ≤MAX_INDEX_LINES facts). list() is
+    // mtime-keyed, so this stays fresh when fact files change on disk; a separate
+    // string cache would re-introduce a staleness hole relative to list().
     const facts = this.list();
     if (facts.length === 0) return '';
     const lines = facts
@@ -196,6 +226,7 @@ export class MemoryStore {
   /** Drop the cached snapshot for a scope after a write touches its files. */
   private invalidate(scope: MemoryScope): void {
     this.scopeCache.delete(scope);
+    this.listCache = null;
   }
 
   private readScope(scope: MemoryScope): MemoryFact[] {
@@ -289,12 +320,32 @@ export class MemoryStore {
     return true;
   }
 
-  private uniqueName(dir: string, base: string): string {
-    let candidate = base;
-    for (let i = 2; existsSync(join(dir, `${candidate}.md`)); i += 1) {
-      candidate = `${base}-${i}`;
+  /**
+   * Atomically claim a unique `<name>.md` under `dir` and write `content(name)`
+   * to it. Uses O_EXCL (flag 'wx') so the create itself fails if the path
+   * already exists, instead of the old existsSync-probe-then-write approach:
+   * two processes racing to add a memory with the same slugified description
+   * at nearly the same time could both pass the existsSync check for the same
+   * candidate name, then one's write would silently clobber the other's fact
+   * with no error (matches the same fix findings/store.ts already applies to
+   * its own filename collisions). On EEXIST, bump the suffix and retry.
+   */
+  private writeUnique(
+    dir: string,
+    base: string,
+    content: (name: string) => string,
+  ): { name: string; file: string } {
+    for (let i = 1; ; i += 1) {
+      const name = i === 1 ? base : `${base}-${i}`;
+      const file = join(dir, `${name}.md`);
+      try {
+        writeFileSync(file, content(name), { mode: 0o600, flag: 'wx' });
+        return { name, file };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EEXIST') continue;
+        throw err;
+      }
     }
-    return candidate;
   }
 }
 
@@ -310,22 +361,6 @@ export function formatMemoryRecall(facts: MemoryFact[]): string {
     out.push('', `## ${f.name} (${f.type})`, f.text);
   }
   return out.join('\n');
-}
-
-/** Crash-safe synchronous write: stage in a sibling tmp, then atomic rename. */
-function atomicWriteFileSync(file: string, content: string): void {
-  const tmp = `${file}.tmp.${randomBytes(3).toString('hex')}`;
-  try {
-    writeFileSync(tmp, content, { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch (err) {
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      /* ignore */
-    }
-    throw err;
-  }
 }
 
 /** 1 → 1+RECENCY_BOOST as a fact approaches `refMs`, decaying with age. */

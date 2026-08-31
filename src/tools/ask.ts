@@ -81,13 +81,21 @@ export class AskUserTool implements Tool {
 
     const answers: Array<{ question: string; answer: string }> = [];
     for (let i = 0; i < raw.length; i += 1) {
-      const qm = raw[i] as Record<string, unknown>;
+      const item = raw[i];
+      // A malformed call like questions:[null] used to throw an uncaught
+      // TypeError from property access below instead of a controlled
+      // validation message.
+      if (typeof item !== 'object' || item === null) {
+        throw new Error(`questions[${i}]: must be an object`);
+      }
+      const qm = item as Record<string, unknown>;
       const qtext = typeof qm.question === 'string' ? qm.question : '';
       if (!qtext) throw new Error(`questions[${i}]: question text is required`);
       const header = typeof qm.header === 'string' ? qm.header : undefined;
       const rawOpts = Array.isArray(qm.options) ? qm.options : [];
       const opts: Option[] = [];
       for (const ro of rawOpts) {
+        if (typeof ro !== 'object' || ro === null) continue;
         const om = ro as Record<string, unknown>;
         const label = typeof om.label === 'string' ? om.label : '';
         const description = typeof om.description === 'string' ? om.description : undefined;

@@ -219,6 +219,27 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
 
+// ---------------------------------------------------------------------------
+// Terminal-escape scrubbing — tool output routinely contains bytes we don't
+// control (a target's HTTP response, a scanned banner, a file's contents).
+// Rendered verbatim, those bytes can carry OSC 52 (overwrite the system
+// clipboard), OSC 0/2 (spoof the terminal title), CSI cursor/erase sequences
+// (hide or fabricate transcript lines — including in the permission prompt
+// the user is about to approve), or OSC 8 (disguised hyperlinks). Strip every
+// C0/C1 control byte and ESC-introduced sequence except the ones that keep
+// output readable (\n, \t); colorize* below re-adds our own trusted ANSI SGR
+// codes afterward, so visual styling is unaffected.
+// ---------------------------------------------------------------------------
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally matching control bytes to strip them
+const ESC_SEQUENCE_RE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|[[?][0-9;:]*[a-zA-Z]|[@-Z\\-_])/g;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally matching control bytes to strip them
+const OTHER_CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+/** Strip ANSI/OSC escape sequences and other control bytes from untrusted text. */
+export function stripControlSequences(s: string): string {
+  return s.replace(ESC_SEQUENCE_RE, '').replace(OTHER_CONTROL_RE, '');
+}
+
 /**
  * MCP tools hand back a `content` array of typed blocks, which mcp.ts
  * serializes as `JSON.stringify(content, null, 2)`. For the common
@@ -258,7 +279,7 @@ function formatBytes(n: number): string {
  * both views. Short results return `collapsible: false` with preview === full.
  */
 export function buildToolResultView(raw: string): ToolResultView {
-  const content = compactShellResultForTranscript(extractTextContent(raw));
+  const content = stripControlSequences(compactShellResultForTranscript(extractTextContent(raw)));
   const colorize: (s: string) => string = looksLikeShellResult(content)
     ? colorizeShellResult
     : looksLikeHTTPResult(content)
@@ -277,6 +298,8 @@ export function buildToolResultView(raw: string): ToolResultView {
   const hiddenLines = Math.max(0, lines.length - shownLines);
   const what =
     hiddenLines > 0 ? `${hiddenLines} more line${hiddenLines === 1 ? '' : 's'}` : 'more output';
-  const notice = chalk.dim(`… ${what} · ${formatBytes(content.length)} — Ctrl-O to expand`);
+  const notice = chalk.dim(
+    `… ${what} · ${formatBytes(content.length)} — click or Ctrl-O to expand`,
+  );
   return { full, preview: `${colorize(headStr)}\n${notice}`, collapsible: true };
 }

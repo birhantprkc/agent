@@ -6,12 +6,14 @@
 // position; we accumulate them per-index and assign a fallback ID if the
 // server omits one.
 
+import { warn } from '../logger/logger.js';
 import type { Client, Pinger, StreamingClient } from './client.js';
+import { parseContentToolCalls } from './contentToolCalls.js';
 import { type BackendError, classifyBackend, parseRetryAfter } from './errors.js';
 import { newCallID } from './ids.js';
 import { kimiLocksTemperature, kimiSupportsThinkingToggle } from './providers.js';
-import { withRetry } from './retry.js';
-import type { ChatRequest, ChatResponse, Message, ToolCall } from './types.js';
+import { type RetryInfo, withRetry } from './retry.js';
+import type { ChatRequest, ChatResponse, Message, ToolCall, Usage } from './types.js';
 
 /** Annotate a backend error with the server's Retry-After so withRetry can
  *  honor it instead of its computed backoff. */
@@ -45,12 +47,19 @@ interface OAIChoiceMessage {
   }>;
 }
 
+interface OAIUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+}
+
 interface OAIChatResp {
   choices?: Array<{
     message: OAIChoiceMessage;
     finish_reason?: string;
   }>;
   error?: { message: string };
+  usage?: OAIUsage;
 }
 
 interface OAIStreamResp {
@@ -66,6 +75,19 @@ interface OAIStreamResp {
     };
     finish_reason?: string;
   }>;
+  // Only present on the terminal chunk, and only when the request asked for
+  // it via stream_options.include_usage — that chunk carries an empty
+  // `choices` array alongside it, per the OpenAI streaming spec.
+  usage?: OAIUsage;
+}
+
+function toUsage(u: OAIUsage | undefined): Usage | undefined {
+  if (!u) return undefined;
+  return {
+    inputTokens: u.prompt_tokens ?? 0,
+    outputTokens: u.completion_tokens ?? 0,
+    cachedInputTokens: u.prompt_tokens_details?.cached_tokens,
+  };
 }
 
 /** Smallest non-negative integer key not already present in the map. Used to
@@ -123,10 +145,23 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
     this.maxTokens = genOpts.maxTokens;
   }
 
-  static lmStudio(baseURL: string, model: string): OpenAIClient {
+  static lmStudio(
+    baseURL: string,
+    model: string,
+    genOpts: { temperature?: number; maxTokens?: number } = {},
+  ): OpenAIClient {
     // LM Studio ignores auth — pass empty so the Authorization header is
     // omitted entirely (the chat/ping paths already guard on apiKey).
-    return new OpenAIClient(baseURL || 'http://localhost:1234/v1', '', model, 'lmstudio');
+    // Forward temperature/max_tokens like every other OpenAI-compatible
+    // backend so config knobs aren't silently ignored for local models.
+    return new OpenAIClient(
+      baseURL || 'http://localhost:1234/v1',
+      '',
+      model,
+      'lmstudio',
+      {},
+      genOpts,
+    );
   }
 
   name(): string {
@@ -141,16 +176,23 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
     const headers: Record<string, string> = {};
     if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
     const resp = await fetch(`${this.baseURL}/models`, { method: 'GET', headers, signal });
-    if (resp.status >= 500) {
+    // Any non-2xx means disconnected — a dead proxy, bad key, or wrong path
+    // (404) is just as "not ready" as a 5xx, and previously only 5xx failed
+    // the probe, so those cases showed "ready" with no working backend.
+    if (resp.status < 200 || resp.status >= 300) {
       throw new Error(`${this.label} status ${resp.status}`);
     }
   }
 
-  async chat(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
+  async chat(
+    req: ChatRequest,
+    signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
+  ): Promise<ChatResponse> {
     // Retry rate limits / transient 5xx with backoff (E7). The non-streaming
     // call has no observable side effects before it returns, so it's safe to
     // re-run wholesale.
-    return withRetry(() => this.chatOnce(req, signal), { signal });
+    return withRetry(() => this.chatOnce(req, signal), { signal, onRetry });
   }
 
   private async chatOnce(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
@@ -195,12 +237,16 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
       }
       const choice = out.choices[0];
       if (!choice) throw new Error(`${this.label}: empty choices`);
-      // Prefer content; fall back to reasoning_content only when content is
-      // empty (M7) so a reasoning-only non-streaming response isn't blank.
-      const rawText = choice.message.content || choice.message.reasoning_content || '';
+      // Mirror the streaming path (below): reasoning_content is shown as live
+      // progress but never accumulated into the returned message, so it can't
+      // re-enter history and get replayed as context on every later turn.
+      // A reasoning model that exhausts its token budget mid-thought (tight
+      // max_tokens) can legitimately return empty content here — that's the
+      // same "no visible answer this turn" outcome the streaming path already
+      // produces in that case, not a regression.
       const msg: Message = {
         role: 'assistant',
-        content: this.trimLeakedTemplate(rawText),
+        content: this.trimLeakedTemplate(choice.message.content || ''),
       };
       if (choice.message.tool_calls?.length) {
         msg.toolCalls = choice.message.tool_calls.map<ToolCall>((tc) => ({
@@ -208,8 +254,21 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
           type: 'function',
           function: { name: tc.function.name, arguments: tc.function.arguments },
         }));
+      } else if (choice.message.content) {
+        // Fallback for models/backends that emit tool use as text/JSON in content
+        // (common with smaller or fine-tuned models over openai-compat).
+        const knownTools = new Set((req.tools ?? []).map((t) => t.function.name));
+        const fromContent = parseContentToolCalls(choice.message.content, knownTools);
+        if (fromContent.length) {
+          msg.toolCalls = fromContent.map((c) => ({
+            id: newCallID(),
+            type: 'function',
+            function: { name: c.name, arguments: JSON.stringify(c.arguments) },
+          }));
+          msg.content = '';
+        }
       }
-      return { message: msg, finishReason: choice.finish_reason ?? '' };
+      return { message: msg, finishReason: choice.finish_reason ?? '', usage: toUsage(out.usage) };
     } finally {
       dispose();
     }
@@ -219,11 +278,15 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
     req: ChatRequest,
     onDelta: (delta: string) => void,
     signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
   ): Promise<ChatResponse> {
     // Retry only the connection setup (E7): a transient 429/5xx surfaces before
     // any delta is emitted, so re-running openStream can't double-emit tokens.
     // Once the 200 stream is flowing, a mid-stream failure is NOT retried.
-    const { resp, dispose } = await withRetry(() => this.openStream(req, signal), { signal });
+    const { resp, dispose } = await withRetry(() => this.openStream(req, signal), {
+      signal,
+      onRetry,
+    });
     if (!resp.body) {
       dispose();
       throw new Error(`${this.label}: empty stream body`);
@@ -243,6 +306,8 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
     // split its name/args (M6). -1 = no fallback call started yet.
     let fallbackIndex = -1;
     let stoppedByTemplate = false;
+    let skipped = 0;
+    let usage: OAIUsage | undefined;
 
     try {
       for await (const line of iterSSE(resp.body)) {
@@ -253,9 +318,22 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
         let chunk: OAIStreamResp;
         try {
           chunk = JSON.parse(data) as OAIStreamResp;
-        } catch {
+        } catch (err) {
+          // Drop the malformed SSE chunk but surface enough detail to diagnose
+          // vanished tool calls (a fragmented tool_call delta can hide here).
+          skipped += 1;
+          const preview = data.length > 200 ? `${data.slice(0, 200)}…` : data;
+          warn('openai: dropped malformed stream chunk', {
+            err: err instanceof Error ? err.message : String(err),
+            preview,
+            total_skipped: skipped,
+          });
           continue;
         }
+        // The usage-bearing terminal chunk (when stream_options.include_usage
+        // was requested) carries an empty `choices` array, so capture usage
+        // before the choice guard below would otherwise `continue` past it.
+        if (chunk.usage) usage = chunk.usage;
         const choice = chunk.choices?.[0];
         if (!choice) continue;
         if (choice.finish_reason) finish = choice.finish_reason;
@@ -326,8 +404,23 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
           function: { name: p.name, arguments: p.args },
         };
       });
+    } else if (finalContent) {
+      // Fallback: some openai-compat servers + small models stream the tool call
+      // as text content instead of structured deltas.
+      const knownTools = new Set((req.tools ?? []).map((t) => t.function.name));
+      const fromContent = parseContentToolCalls(finalContent, knownTools);
+      if (fromContent.length) {
+        msg.toolCalls = fromContent.map((c) => ({
+          id: newCallID(),
+          type: 'function',
+          function: { name: c.name, arguments: JSON.stringify(c.arguments) },
+        }));
+        // Clear content if we successfully extracted tool calls from it, to avoid
+        // leaking the raw JSON into the transcript.
+        msg.content = '';
+      }
     }
-    return { message: msg, finishReason: finish };
+    return { message: msg, finishReason: finish, usage: toUsage(usage) };
   }
 
   /** Open the SSE stream and return the live 200 response paired with a
@@ -395,6 +488,7 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
       temperature?: number;
       max_tokens?: number;
       max_completion_tokens?: number;
+      stream_options?: { include_usage: boolean };
     } = {
       model: this.modelID,
       stream,
@@ -451,6 +545,14 @@ export class OpenAIClient implements Client, StreamingClient, Pinger {
       if (this.label === 'kimi') body.max_completion_tokens = this.maxTokens;
       else body.max_tokens = this.maxTokens;
     }
+    // Ask the server for a terminal usage chunk on streams. Without this,
+    // TokenAccountant under-reports input/output for the default streaming
+    // path (OpenAI, Kimi, Groq, OpenRouter, DeepSeek, LM Studio, …).
+    // Some strict proxies reject unknown fields — they ignore extras or we
+    // already treat a missing usage chunk as zero usage, so this is safe.
+    if (stream) {
+      body.stream_options = { include_usage: true };
+    }
     return body;
   }
 
@@ -496,6 +598,12 @@ function longestStopPrefixSuffix(content: string, stops: readonly string[]): num
  * (event boundary) and also on `\n` for single-line events. Yields each
  * raw line so the caller can inspect `data:` / `event:` prefixes.
  */
+// Bounds how much of one undelimited logical line this buffers before giving
+// up — a broken or malicious proxy streaming a large payload with no
+// newlines would otherwise grow `buffer` without limit (memory exhaustion),
+// since it's only ever appended to and never capped.
+const MAX_SSE_LINE_BYTES = 8 * 1024 * 1024;
+
 async function* iterSSE(body: ReadableStream<Uint8Array>): AsyncIterable<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -511,6 +619,9 @@ async function* iterSSE(body: ReadableStream<Uint8Array>): AsyncIterable<string>
         buffer = buffer.slice(idx + 1);
         if (line) yield line;
         idx = buffer.indexOf('\n');
+      }
+      if (buffer.length > MAX_SSE_LINE_BYTES) {
+        throw new Error(`SSE stream: line exceeded ${MAX_SSE_LINE_BYTES} bytes with no newline`);
       }
     }
     buffer += decoder.decode();

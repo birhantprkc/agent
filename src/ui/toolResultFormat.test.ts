@@ -182,7 +182,7 @@ describe('buildToolResultView', () => {
     // 12 head lines + 1 notice line.
     expect(previewLines.length).toBeLessThanOrEqual(13);
     expect(stripAnsi(v.preview)).toContain('more lines');
-    expect(stripAnsi(v.preview)).toContain('Ctrl-O to expand');
+    expect(stripAnsi(v.preview)).toContain('click or Ctrl-O to expand');
     // Full view keeps everything.
     expect(stripAnsi(v.full)).toContain('line 199');
   });
@@ -191,7 +191,7 @@ describe('buildToolResultView', () => {
     const v = buildToolResultView('x'.repeat(5000));
     expect(v.collapsible).toBe(true);
     expect(stripAnsi(v.preview).length).toBeLessThan(1100);
-    expect(stripAnsi(v.preview)).toContain('Ctrl-O to expand');
+    expect(stripAnsi(v.preview)).toContain('click or Ctrl-O to expand');
   });
 
   it('extracts MCP text then collapses it (browser snapshot end-to-end)', () => {

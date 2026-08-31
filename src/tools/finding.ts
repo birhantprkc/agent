@@ -100,10 +100,13 @@ export class ConfirmFindingTool implements Tool {
       slug: slugify(title) || `finding-${Date.now()}`,
     };
 
-    const path = await this.store.save(finding);
-    this.notifier(finding, path);
+    const result = await this.store.save(finding);
+    if (result.duplicate) {
+      return `Finding "${finding.title}" already recorded at ${result.path} (same title+url+parameter) — skipped duplicate.`;
+    }
 
-    return `Finding "${finding.title}" written to ${path}`;
+    this.notifier(finding, result.path);
+    return `Finding "${finding.title}" written to ${result.path}`;
   }
 }
 

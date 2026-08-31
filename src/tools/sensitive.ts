@@ -4,7 +4,7 @@
 // explicit user prompt.
 
 import { homedir } from 'node:os';
-import { resolve, sep } from 'node:path';
+import { basename, resolve, sep } from 'node:path';
 
 // macOS canonicalizes /etc -> /private/etc, so denylist both spellings: a
 // file_read of /private/etc/sudoers (or a realpath that lands there) must be
@@ -13,31 +13,52 @@ const SYSTEM_PATHS = [
   '/etc/shadow',
   '/etc/sudoers',
   '/etc/master.passwd',
+  '/etc/passwd',
   '/private/etc/shadow',
   '/private/etc/sudoers',
   '/private/etc/master.passwd',
+  '/private/etc/passwd',
 ];
 
 const HOME_RELATIVE = [
   '.ssh',
   '.aws',
+  '.azure',
   '.gnupg',
   '.gcloud',
   '.kube',
   '.docker',
   '.config/gcloud',
   '.config/op',
+  '.config/gh',
   '.pentesterflow',
   '.netrc',
   '.pgpass',
   '.npmrc',
   '.pypirc',
+  '.git-credentials',
   '.bash_history',
   '.zsh_history',
   '.python_history',
   '.mysql_history',
   '.psql_history',
+  // Browser cookie/session-token stores — reading these is effectively
+  // session hijacking against every site the operator is logged into.
+  'Library/Application Support/Google/Chrome',
+  'Library/Application Support/BraveSoftware/Brave-Browser',
+  'Library/Application Support/Firefox',
+  'Library/Cookies',
+  '.config/google-chrome',
+  '.config/BraveSoftware/Brave-Browser',
+  '.mozilla/firefox',
 ];
+
+// Matched by filename wherever it occurs, not just under $HOME — .env files
+// conventionally live at a project root, which can be anywhere on disk.
+// Case-insensitive; matches .env, .env.local, .env.production, etc. — but
+// anchored so it doesn't false-positive on an unrelated name that merely
+// starts with those letters (e.g. `.environment`).
+const SENSITIVE_BASENAME_RE = /^\.env(\..*)?$/i;
 
 /**
  * Returns true when `abs` (an absolute path) matches a known-sensitive
@@ -50,6 +71,8 @@ export function isSensitivePath(abs: string): boolean {
   for (const p of SYSTEM_PATHS) {
     if (matchesPath(cleaned, p)) return true;
   }
+
+  if (SENSITIVE_BASENAME_RE.test(basename(cleaned))) return true;
 
   const home = homedir();
   if (!home) return false;

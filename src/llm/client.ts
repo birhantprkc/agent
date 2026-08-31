@@ -5,6 +5,7 @@
 // can wrap onDelta into an iterator if it wants to expose tokens as a
 // stream further up.
 
+import type { RetryInfo } from './retry.js';
 import type { ChatRequest, ChatResponse } from './types.js';
 
 export interface Client {
@@ -12,20 +13,29 @@ export interface Client {
   name(): string;
   /** Currently-selected model id. */
   model(): string;
-  /** Non-streaming chat request. */
-  chat(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse>;
+  /**
+   * Non-streaming chat request. `onRetry`, when given, fires before each
+   * transient-failure backoff wait — the caller's hook for surfacing "rate
+   * limited, retrying…" to the user instead of a silent multi-second pause.
+   */
+  chat(
+    req: ChatRequest,
+    signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
+  ): Promise<ChatResponse>;
 }
 
 export interface StreamingClient extends Client {
   /**
    * Streaming chat. `onDelta` is invoked for each token/chunk; the
    * returned promise resolves once the stream completes with the
-   * accumulated message + finish reason.
+   * accumulated message + finish reason. `onRetry` — see Client.chat().
    */
   chatStream(
     req: ChatRequest,
     onDelta: (delta: string) => void,
     signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
   ): Promise<ChatResponse>;
 }
 

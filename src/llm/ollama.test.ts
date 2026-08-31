@@ -47,6 +47,96 @@ beforeAll(async () => {
         return;
       }
 
+      if (body.model === 'thinking-nonstream') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            message: {
+              role: 'assistant',
+              content: 'the answer is 42',
+              thinking: 'let me work it out',
+            },
+            done: true,
+            done_reason: 'stop',
+          }),
+        );
+        return;
+      }
+
+      if (body.model === 'thinking-only-nonstream') {
+        // Whole budget spent thinking — content empty, thinking has the only text.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            message: {
+              role: 'assistant',
+              content: '',
+              thinking: 'still ruminating, ran out of tokens',
+            },
+            done: true,
+            done_reason: 'length',
+          }),
+        );
+        return;
+      }
+
+      if (body.model === 'usage-nonstream') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            message: { role: 'assistant', content: 'hi' },
+            done: true,
+            done_reason: 'stop',
+            prompt_eval_count: 30,
+            eval_count: 5,
+          }),
+        );
+        return;
+      }
+
+      if (body.model === 'usage-stream') {
+        // Counts only appear on the terminal done:true chunk.
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        res.write(`${JSON.stringify({ message: { role: 'assistant', content: 'hi ' } })}\n`);
+        res.end(
+          `${JSON.stringify({
+            message: { role: 'assistant', content: 'there' },
+            done: true,
+            done_reason: 'stop',
+            prompt_eval_count: 33,
+            eval_count: 8,
+          })}\n`,
+        );
+        return;
+      }
+
+      if (body.model === 'thinking-stream') {
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        res.write(
+          `${JSON.stringify({ message: { role: 'assistant', content: '', thinking: 'Let' } })}\n`,
+        );
+        res.write(
+          `${JSON.stringify({ message: { role: 'assistant', content: '', thinking: ' me think.' } })}\n`,
+        );
+        res.write(`${JSON.stringify({ message: { role: 'assistant', content: '42' } })}\n`);
+        res.end(
+          `${JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop' })}\n`,
+        );
+        return;
+      }
+
+      if (body.model === 'thinking-only-stream') {
+        // Model spends its whole budget thinking — content never arrives.
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        res.write(
+          `${JSON.stringify({ message: { role: 'assistant', content: '', thinking: 'stuck ruminating' } })}\n`,
+        );
+        res.end(
+          `${JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, done_reason: 'length' })}\n`,
+        );
+        return;
+      }
+
       if (body.model === 'streaming-length-truncated') {
         // Streaming terminal chunk carries done_reason=length.
         res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
@@ -237,6 +327,109 @@ describe('OllamaClient', () => {
     expect(out.finishReason).toBe('stop');
   });
 
+  it('forwards tool_name on role:tool messages for multi-tool association', async () => {
+    lastBody = null;
+    const c = new OllamaClient(baseURL, 'qwen2.5:7b');
+    await c.chat({
+      model: 'qwen2.5:7b',
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            { id: '1', type: 'function', function: { name: 'http', arguments: '{}' } },
+            { id: '2', type: 'function', function: { name: 'shell', arguments: '{}' } },
+          ],
+        },
+        { role: 'tool', content: 'ok-http', toolCallID: '1', name: 'http' },
+        { role: 'tool', content: 'ok-shell', toolCallID: '2', name: 'shell' },
+      ],
+    });
+    const msgs = lastBody?.messages as Array<{
+      role: string;
+      tool_name?: string;
+      content?: string;
+    }>;
+    expect(msgs).toBeTruthy();
+    const toolMsgs = msgs.filter((m) => m.role === 'tool');
+    expect(toolMsgs).toHaveLength(2);
+    expect(toolMsgs[0]?.tool_name).toBe('http');
+    expect(toolMsgs[1]?.tool_name).toBe('shell');
+  });
+
+  it('non-streaming chat maps prompt_eval_count/eval_count to usage', async () => {
+    const c = new OllamaClient(baseURL, 'usage-nonstream');
+    const out = await c.chat({
+      model: 'usage-nonstream',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(out.usage).toEqual({ inputTokens: 30, outputTokens: 5 });
+  });
+
+  it('streaming chat maps usage from the terminal done:true chunk', async () => {
+    const c = new OllamaClient(baseURL, 'usage-stream');
+    const out = await c.chatStream(
+      { model: 'usage-stream', messages: [{ role: 'user', content: 'hi' }] },
+      () => undefined,
+    );
+    expect(out.usage).toEqual({ inputTokens: 33, outputTokens: 8 });
+  });
+
+  it('leaves usage undefined when the backend reports no counts', async () => {
+    const c = new OllamaClient(baseURL, 'qwen2.5:7b');
+    const out = await c.chat({ model: 'qwen2.5:7b', messages: [{ role: 'user', content: 'hi' }] });
+    expect(out.usage).toBeUndefined();
+  });
+
+  it('streams thinking as visible deltas but excludes it from the returned message', async () => {
+    const c = new OllamaClient(baseURL, 'thinking-stream');
+    const deltas: string[] = [];
+    const out = await c.chatStream(
+      { model: 'thinking-stream', messages: [{ role: 'user', content: 'go' }] },
+      (d) => deltas.push(d),
+    );
+    expect(deltas.join('')).toBe('Let me think.42');
+    expect(out.message.content).toBe('42');
+    expect(out.message.content).not.toContain('Let me think');
+  });
+
+  it('non-streaming chat keeps thinking out of content when content is present', async () => {
+    const c = new OllamaClient(baseURL, 'thinking-nonstream');
+    const out = await c.chat({
+      model: 'thinking-nonstream',
+      messages: [{ role: 'user', content: 'go' }],
+    });
+    expect(out.message.content).toBe('the answer is 42');
+    expect(out.message.content).not.toContain('let me work it out');
+  });
+
+  it('non-streaming returns empty content when the model spent its whole budget reasoning (never re-enters history)', async () => {
+    const c = new OllamaClient(baseURL, 'thinking-only-nonstream');
+    const out = await c.chat({
+      model: 'thinking-only-nonstream',
+      messages: [{ role: 'user', content: 'go' }],
+    });
+    // The old fallback-to-thinking behavior let raw chain-of-thought re-enter
+    // history via message.content, contradicting this file's own invariant
+    // that reasoning stays out of the returned message — an empty turn is
+    // the correct outcome here, matching what streaming already does below.
+    expect(out.message.content).toBe('');
+    expect(out.finishReason).toBe('length');
+  });
+
+  it('streaming shows accumulated thinking live but returns empty content (never re-enters history)', async () => {
+    const c = new OllamaClient(baseURL, 'thinking-only-stream');
+    const deltas: string[] = [];
+    const out = await c.chatStream(
+      { model: 'thinking-only-stream', messages: [{ role: 'user', content: 'go' }] },
+      (d) => deltas.push(d),
+    );
+    expect(deltas.join('')).toBe('stuck ruminating');
+    expect(out.message.content).toBe('');
+    expect(out.finishReason).toBe('length');
+  });
+
   it('streaming accumulates tool calls from intermediate chunks', async () => {
     const c = new OllamaClient(baseURL, 'streaming-with-tool');
     const deltas: string[] = [];
@@ -280,6 +473,8 @@ describe('OllamaClient', () => {
     expect(out.message.toolCalls?.[0]?.function.arguments).toBe(
       '{"method":"GET","url":"https://x.example.com"}',
     );
+    // The raw JSON must not leak into the transcript once lifted into a tool call.
+    expect(out.message.content).toBe('');
     expect(out.finishReason).toBe('tool_calls');
   });
 
@@ -327,6 +522,8 @@ describe('OllamaClient', () => {
     expect(out.message.toolCalls?.[0]?.function.arguments).toBe(
       '{"url":"https://x.example.com/stream"}',
     );
+    // Content cleared so the raw JSON isn't replayed alongside the tool call.
+    expect(out.message.content).toBe('');
     expect(out.finishReason).toBe('tool_calls');
   });
 
@@ -344,6 +541,8 @@ describe('OllamaClient', () => {
     });
 
     expect(out.message.toolCalls).toBeUndefined();
+    // Nothing was extracted, so the original content is preserved (not cleared).
+    expect(out.message.content).not.toBe('');
     expect(out.finishReason).toBe('stop');
   });
 
@@ -469,5 +668,22 @@ describe('OllamaClient', () => {
   it('ping rejects on connection failure', async () => {
     const c = new OllamaClient('http://127.0.0.1:1', 'qwen2.5:7b');
     await expect(c.ping()).rejects.toBeInstanceOf(Error);
+  });
+
+  it('strips trailing slashes from baseURL', () => {
+    const c = new OllamaClient(`${baseURL}/`, 'qwen2.5:7b');
+    expect(c.baseURL).toBe(baseURL);
+  });
+
+  it('chat 404 includes model + url context (endpoint-not-found)', async () => {
+    // baseURL with an extra path segment so /api/chat never hits the mock route.
+    const dead = new OllamaClient(`${baseURL}/nope`, 'qwen2.5:7b');
+    await expect(
+      dead.chat({ model: 'qwen2.5:7b', messages: [{ role: 'user', content: 'hi' }] }),
+    ).rejects.toMatchObject({
+      name: 'BackendError',
+      statusCode: 404,
+      category: 'endpoint-not-found',
+    });
   });
 });

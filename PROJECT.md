@@ -6,10 +6,10 @@
 > pentesting tools behind permission gates, remembers lessons across sessions, and writes
 > evidence-backed findings.
 
-- **Package:** `@pentesterflow/agent` · version `0.1.0-dev`
-- **License:** Apache-2.0 · **Node:** `>=20`
-- **Language:** TypeScript (ESM) · ~24,000 LOC across 143 source files · 57 test files
-- **Runtime UI:** Ink (React for the terminal)
+- **Package:** `@pentesterflow/agent` · version `0.3.0`
+- **License:** Apache-2.0 · **Node:** `>=20` · **Package manager:** Bun (recommended)
+- **Language:** TypeScript (ESM)
+- **Runtime UI:** OpenTUI (`@opentui/react`) — sole terminal UI
 - **Binaries:** `pentesterflow` (the CLI) and `pentesterflow-browser-mcp` (capture MCP server)
 - **Repo homepage:** https://github.com/pentesterflow/agent
 
@@ -28,7 +28,7 @@
 9. [Memory, sessions & continuous learning](#9-memory-sessions--continuous-learning)
 10. [Coverage & findings](#10-coverage--findings)
 11. [Browser / Burp capture & MCP](#11-browser--burp-capture--mcp)
-12. [Terminal UI (Ink/React)](#12-terminal-ui-inkreact)
+12. [Terminal UI (OpenTUI)](#12-terminal-ui-opentui)
 13. [Configuration & data paths](#13-configuration--data-paths)
 14. [Cross-cutting: redaction, logging, target, update, version](#14-cross-cutting-utilities)
 15. [Slash commands & CLI flags reference](#15-slash-commands--cli-flags-reference)
@@ -69,39 +69,36 @@ poor tooling (real shell/HTTP/Burp/MCP), and lack of auditability (deterministic
         │ builds & injects
         ▼
 ┌─────────────────┐   events    ┌──────────────────────────────────────┐
-│  Agent (loop)   │◄───────────►│  Ink/React TUI (src/ui/App.tsx)       │
-│  src/agent/*    │  bridges    │  transcript · modals · menus · banner  │
+│  Agent (loop)   │◄───────────►│  OpenTUI App (src/ui-opentui/App.tsx) │
+│  src/agent/*    │  bridges    │  ChatPane · modals · status bar        │
 └───┬──────┬──────┘             └──────────────────────────────────────┘
     │      │
     │      │ calls                ┌──────────────┐
     │      └─────────────────────►│ LLM Client    │ ollama/openai-compat/
-    │                             │ src/llm/*     │ kimi/groq/openrouter/
-    │                             └──────────────┘ deepseek/gemini/lmstudio
+    │                             │ src/llm/*     │ anthropic/gemini/…   │
+    │                             └──────────────┘
     │ executes (permission-gated)
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Tool Registry (src/tools/*)                                          │
-│  shell · http · file_* · glob/grep · web_* · ask_user ·               │
-│  confirm_finding · coverage · load_skill · browser_capture_* · MCP    │
+│  shell · http · file_* · search · web_* · ask · todo · scope ·        │
+│  confirm_finding · coverage · load_skill · delegate · bg jobs · MCP   │
 └──────────────────────────────────────────────────────────────────────┘
     │            │            │              │              │
     ▼            ▼            ▼              ▼              ▼
  Skills      Findings    Coverage     Intelligence    Browser/Burp
  registry    store       store        store           capture store
- + SKILL.md  ./findings  coverage-*   scenarios.jsonl  + ingest server
 ```
 
 The **agent loop runs outside React**. It communicates with the TUI through an event sink
-(`AgentEvent`) and two "bridge" objects (permission + ask) that publish requests into React
-state to surface modals. The CLI entry point owns the wiring: it constructs the LLM client,
-tool registry, skill registry, all the stores, the permission prompter, and then mounts the
-Ink app.
+(`AgentEvent`) and bridge publishers (permission, ask, notices) that surface modals and
+system lines. Shared UI logic lives in `src/ui/` (state, commands, formatting); rendering
+lives only in `src/ui-opentui/`.
 
-**Key dependencies:** `ink` + `react` (TUI), `@modelcontextprotocol/sdk` (MCP), `undici`
-(HTTP with custom TLS dispatcher), `zod` (config/schema validation), `zustand` (state stores),
-`gray-matter` (SKILL.md frontmatter), `marked`/`marked-terminal`/`cli-highlight` (markdown
-rendering), `pino` (logging), `execa` (subprocess), `fast-glob` (search),
-`write-file-atomic` (crash-safe writes), `chalk` (colors).
+**Key dependencies:** `@opentui/core` + `@opentui/react` + `react` (TUI),
+`@modelcontextprotocol/sdk` (MCP), `undici` (HTTP), `zod` (config), `zustand` (stores),
+`gray-matter` (skills), `marked` / `cli-highlight` (markdown), `pino` (logging), `execa`
+(subprocesses), `fast-glob`, `write-file-atomic`, `chalk`.
 
 ---
 
@@ -146,8 +143,9 @@ rendering), `pino` (logging), `execa` (subprocess), `fast-glob` (search),
     surface a one-line "skills reloaded" notice.
 18. **Background probes** (`runProbes`) — (a) tool-calling probe and (b) Ollama `num_ctx`
     detection; both best-effort, feed banner pills/warnings.
-19. **Mount the Ink app** (`render(<App .../>)`), wiring publisher bridges, `applyProvider`
-    (live `/provider` + `/model` swaps re-probe), `startBurpBridge`, etc.
+19. **Mount the OpenTUI app** (`createCliRenderer` + `ui-opentui/App`), wiring publisher
+    bridges, `applyProvider` (live `/provider` + `/model` swaps re-probe), `startBurpBridge`,
+    etc.
 20. **On exit**, trip the root abort, close watchers, MCP sessions, and the Burp bridge; print
     a `pentesterflow --resume <id>` hint.
 
@@ -165,11 +163,12 @@ Located in `src/agent/`. The `Agent` class implements a **plan → act → obser
 
 `Agent.run(userMsg, signal, emit, opts)` is the entry point per turn:
 
-1. **Plan** — auto-compact if token count exceeds threshold; build a **decision plan**
-   (`buildDecisionPlan`) that recommends a skill, assigns a risk level, and renders guidance;
-   emit a `decision` event; expand `@path` mentions; inject relevant intelligence context.
-2. **Act** — loop up to `maxSteps` (default 20): build a `ChatRequest` with history + tool
-   specs, call `chat()` or `chatStream()`, strip `<think>` tags, push the assistant message
+1. **Plan** — auto-compact if token count exceeds threshold; quiet **skill router**
+   (`routeSkill`) may inject short guidance; expand `@path` mentions; inject curated memory
+   and intelligence context.
+2. **Act** — loop up to `maxSteps` (default 20, then TUI auto-continues): build a
+   `ChatRequest` with history + tool specs, call `chat()` or `chatStream()`, strip `<think>`
+   tags, push the assistant message
    into history, emit `assistant-text`/`assistant-delta`.
 3. **Observe** — for each tool call: parse args, emit `tool-call`, check the active skill's
    `allowed-tools` policy (`isToolAllowed`), execute via `tools.execute()`, emit `tool-result`
@@ -218,13 +217,14 @@ prompt is rebuilt on profile/skill/target changes and on live skill reload.
 
 ### Other agent files
 
-- **`decisionPlanner.ts`** — `buildDecisionPlan` scores enabled skills against the user message
-  (keyword + name/description matching), computes risk (`high` if the message names
-  exploit/rce/sqlmap/nuclei/ffuf/masscan…), builds a checklist, and renders guidance. Returns
-  `undefined` for off-topic messages (no skill, normal risk, unknown target, no workflow terms).
-- **`events.ts`** — the `AgentEvent` union: `assistant-text`, `assistant-delta`, `tool-call`,
-  `tool-result`, `error`, `compact`, `decision`, `skill-active`, `done`, plus the
-  `MaxStepsError` class.
+- **`skillRouter.ts`** — quiet keyword routing to recommend a skill and risk level without
+  noisy planner transcript spam; injects short guidance into the turn when confident.
+- **`compaction.ts`** — microcompact tool bodies, LLM compact input bound, pinned session
+  memory formatting.
+- **`backgroundTasks.ts` / `toolResultStore.ts`** — detached shell jobs; offload huge tool
+  results out of LLM history.
+- **`events.ts`** — `AgentEvent` union including `subagent-progress`, `todo`, `retry`, and
+  `MaxStepsError` (TUI auto-continues).
 - **`mentions.ts`** — `expandFileMentions` inlines `@path` files (≤64 KB, sensitive paths
   refused) into a "# Referenced files" block; also powers UI mention completion (file index
   capped at 5000 files / 1000 dirs / depth 12; skips `.git`/`node_modules`/`dist`/etc.). The
@@ -367,7 +367,7 @@ match `.ssh`), against both lexical and symlink-resolved real paths.
   every time.
 - **YOLO mode** (`--yolo` / `--dangerously-skip-permissions` / `/yolo on`) — `YoloPrompter`
   auto-approves all prompts to `allow-once`. The shell **denylist still hard-blocks**
-  catastrophic commands regardless. A stderr + amber "SuperMode" badge warns the user.
+  catastrophic commands regardless. An amber **YOLO** badge on the status bar warns the user.
 - **Defense in depth:** shell denylist + portability guard, SSRF gate, sensitive-path gate
   (symlink-proof), TLS-off only inside the HTTP tool, capture server bound to `127.0.0.1` with
   a timing-safe token and chrome-extension CORS.
@@ -503,35 +503,28 @@ queue scan tasks, and import confirmed findings back into Burp as issues.
 
 ---
 
-## 12. Terminal UI (Ink/React)
+## 12. Terminal UI (OpenTUI)
 
-`src/ui/`. The agent runs outside React; state flows in via the event sink and the perm/ask
-bridges.
+**Rendering:** `src/ui-opentui/` · **Shared logic:** `src/ui/` (no Ink).
 
-- **`App.tsx`** — owns global state (`useReducer`), keymap interception (`useInput`), and the
-  multi-line input (`useTextField`). Dispatches `handleSlash()` for every slash command.
-- **`state.ts`** — the `AppState` reducer: `transcript` entries (user/assistant/tool-call/
-  tool-result/system/error/finding/decision), `busy` + `phase`, `apiReady`, `activeSkill`,
-  `pendingPerm`/`pendingAsk`/`pendingSkills`, `yolo`, `transcriptFilter`, `runningTool`.
-  Handles streaming deltas, collapsible tool output (>16 lines / >1200 chars → Ctrl-O expands),
-  and the Ctrl-F filter cycle.
-- **`Transcript.tsx`** — finalized entries print once into native scrollback via Ink `<Static>`
-  (mouse-wheel reaches full history); the streaming entry renders live separately. Markdown via
-  `renderMarkdown()`, with a WeakMap row cache.
-- **Input** — `Input.tsx` (renderer) + `useTextField.ts` (cursor/paste/multiline state) +
-  `SlashMenu.tsx` (command typeahead, Tab-complete) + `MentionMenu.tsx` (path-aware `@file`
-  picker). `menuWindow.ts` provides shared 5-row windowing.
-- **Bridges** — `permBridge.ts` (`BridgedPrompter`) and `askBridge.ts` (`BridgedAskPrompter`)
-  publish agent requests into React state, mount a modal, and resolve the agent's promise on the
-  user's choice.
-- **Modals** — `PermissionModal.tsx` (y/a/n with command detail box), `AskModal.tsx`
-  (multi-choice), `SecretInputModal.tsx` (masked input), `SkillsModal.tsx` (toggle skills).
-- **Chrome** — `Banner.tsx` (one-time launch box: provider/model/endpoint/path + tool-support
-  pill), `StatusBar.tsx` (spinner, phase, elapsed clock, model/target, context %, memory count,
-  SuperMode badge), `FirstRunPicker.tsx` (minimal vs full tooling).
-- **Formatting** — `markdown.ts` (regex inline markdown → ANSI, code highlighting, tables,
-  links), `toolResultFormat.ts` (shell/HTTP colorizers, MCP envelope extraction, collapsible
-  views), `slashItems.ts` (command catalog + dynamic skill entries).
+The agent runs outside React; state flows in via the event sink and perm/ask/notice bridges.
+The CLI mounts a single OpenTUI renderer (alternate screen, mouse enabled).
+
+- **`ui-opentui/App.tsx`** — global state (`useReducer`), `useKeyboard` / `usePaste`,
+  multi-line input (`useTextField`), slash/`@` menus, scroll offset, auto-continue on max
+  steps, clipboard (OSC 52 + host tools). Dispatches `handleSlash()` for every slash command.
+- **`ui/state.ts`** — transcript entries (user/assistant/tool-call/tool-result/system/error/
+  finding/decision/todo), `busy` + `phase`, collapsible tool output + expandable child
+  progress (`↳`), filters, YOLO flag.
+- **`ui-opentui/ChatPane.tsx`** — app-owned chat viewport (wrap + window + wheel); click rows
+  to expand. Row layout helpers in `ui/Transcript.ts` (ROLE_STYLES, markdown rows).
+- **Input** — `ui-opentui/Input.tsx` + `ui/useTextField.ts` + `SlashMenu` / `MentionMenu` +
+  `menuWindow.ts`.
+- **Bridges** — `permBridge.ts`, `askBridge.ts`, notice publisher for jobs/skills/progress.
+- **Modals** — Permission (y/a/n), Ask, Secret input, Skills toggle (all under `ui-opentui/`).
+- **Chrome** — quiet one-line Banner, StatusBar (Ready/Offline, tool name, clock, YOLO),
+  FirstRunPicker (minimal vs full tooling).
+- **Formatting** — `markdown.ts`, `toolResultFormat.ts`, `slashItems.ts`, `clipboard.ts`.
 
 ---
 
@@ -608,13 +601,15 @@ defaults are used.
 | `/snapshot` | Write a redacted context snapshot now |
 | `/burp [port]` | Start the Burp bridge, print URL + token |
 | `/skills [enable\|disable\|new <name>]` | Manage / scaffold skills |
-| `/maxsteps <n>` | Per-turn tool-call cap |
+| `/mode ask\|auto-safe\|yolo\|plan\|act` | Permission tier or plan/act mode |
+| `/jobs` | List background shell jobs |
+| `/report [markdown\|sarif]` | Export confirmed findings |
+| `/maxsteps <n>` | Tool budget before auto-continue |
 | `/thinking on\|off` | Toggle visible reasoning guidance |
 | `/update [version]` | Install latest/pinned release |
 | `/yolo [on\|off]` | Toggle auto-approval (labs) |
 | `/reset` | Clear conversation + saved session |
 | `/clear` | Clear on-screen transcript only |
-| `/<skill-name>` | Load a skill into the next turn |
 | `/exit` · `/quit` | Quit |
 
 ### CLI flags
@@ -626,30 +621,27 @@ defaults are used.
 `--list-tools` · `--list-skills` · `--log <path>` · `--debug-session` ·
 `--debug-session-path <path>` · `--version`/`-v` · `--help`/`-h`.
 
-### Key bindings (TUI)
+### Key bindings (OpenTUI)
 
-Enter send · Ctrl-N/Ctrl-J newline · Esc cancel turn / clear input · Ctrl-C quit ·
-↑/↓ history or cursor · Ctrl-A/Ctrl-E line home/end · Ctrl-O expand truncated output ·
-Ctrl-F cycle transcript filter · mouse-wheel scroll · Tab complete (slash/mention).
+Enter send · Ctrl-N/Ctrl-J newline · Esc cancel turn / clear draft · Ctrl-C quit ·
+↑/↓ history or cursor · Ctrl-A/Ctrl-E line edges · Ctrl-O expand · Ctrl-Y copy last
+output · Cmd/Ctrl+V paste · Ctrl-F filter · PgUp/PgDn/wheel scroll · Tab complete ·
+click expandable rows.
 
 ---
 
 ## 16. Build, test & developer workflow
 
-- **Build:** `tsup` → ESM bundle to `dist/` (`cli.js`, `browser-mcp.js`), Node 20 target,
-  version baked in, shebang banner; externals: `react-devtools-core`, `yoga-wasm-web`,
-  `bufferutil`, `utf-8-validate`.
-- **Type-check:** `tsc --noEmit` (strict, `noUncheckedIndexedAccess`, `noImplicitOverride`,
-  `noFallthroughCasesInSwitch`).
-- **Lint/format:** Biome (2-space, 100-col, LF, organize-imports, `useNodejsImportProtocol`).
-- **Test:** Vitest (`src/**/*.test.{ts,tsx}`, node env) — **57 test files** including a local
-  `testServer.ts`, conformance tests for skills, and `ink-testing-library` UI tests.
-- **Scripts:** `npm run dev[:burp]` (tsx), `build`, `test[:watch]`, `typecheck`, `lint[:fix]`,
-  and `ci` = typecheck + lint + test + build.
-- **CI** (`.github/workflows/ci.yml`): matrix over ubuntu/macos × Node 20/22 running
-  typecheck → lint → test → build. `release.yml` builds/publishes binaries.
-- **Install:** `install.sh` / `install.ps1` download the standalone binary (Bun baseline
-  runtime for older x86_64, no AVX2) and verify the published SHA-256.
+- **Build:** `tsup` → ESM to `dist/` (`cli.js`, `browser-mcp.js`), Node 20, version baked in.
+- **Type-check:** `tsc --noEmit` (strict).
+- **Lint:** Biome on `src/`.
+- **Test:** Vitest for unit tests; `bun test src/ui-opentui` for OpenTUI components
+  (native FFI requires Bun’s runner).
+- **Scripts:** `bun run dev`, `build`, `test`, `test:opentui`, `typecheck`, `lint`,
+  `ci` = typecheck + lint + test + test:opentui + build.
+- **CI:** ubuntu/macos × Bun — full verify including OpenTUI tests. `release.yml` publishes
+  binaries + optional npm.
+- **Install:** `install.sh` / `install.ps1` with SHA-256 verification.
 
 ---
 
@@ -657,42 +649,32 @@ Ctrl-F cycle transcript filter · mouse-wheel scroll · Tab complete (slash/ment
 
 ```
 src/
-  cli/            index.ts (entry/orchestrator), forceColor.ts
-  agent/          agent.ts (loop), systemPrompt.ts, decisionPlanner.ts,
-                  events.ts, mentions.ts, sanitize.ts
-  llm/            factory.ts, client.ts, types.ts, providers.ts,
-                  ollama.ts, openai.ts, gemini.ts, models.ts,
-                  modelWarnings.ts, probe.ts, errors.ts, ids.ts, testServer.ts
-  tools/          registry.ts, types.ts, shell.ts, http.ts, file.ts,
-                  search.ts, web.ts, finding.ts, coverage.ts, ask.ts,
-                  mcp.ts, mcpServers.ts, plugin.ts, browserCapture.ts,
-                  payloads.ts, skillFile.ts, sensitive.ts, privateHost.ts,
-                  aliases.ts, toolDisplay.ts
-  ui/             App.tsx, state.ts, Transcript.tsx, Input.tsx, Banner.tsx,
-                  StatusBar.tsx, PermissionModal.tsx, AskModal.tsx,
-                  SecretInputModal.tsx, SkillsModal.tsx, SlashMenu.tsx,
-                  MentionMenu.tsx, FirstRunPicker.tsx, TerminalSize.tsx,
-                  permBridge.ts, askBridge.ts, markdown.ts,
-                  toolResultFormat.ts, slashItems.ts, useTextField.ts,
-                  menuWindow.ts, colorLevel.ts, usePing.ts
-  skills/         registry.ts, discovery.ts, loadSkill.ts, template.ts, validate.ts
-  session/        store.ts
-  coverage/       store.ts
-  findings/       store.ts, httpRequest.ts
-  intelligence/   store.ts
-  browser/        store.ts, server.ts, mcpServer.ts
-  config/         config.ts
-  redact/         redact.ts, index.ts
-  permission/     permission.ts
-  logger/         logger.ts, sessionDebug.ts
-  target/         target.ts
-  update/         selfUpdate.ts
-  version/        version.ts
-  ask/            ask.ts
+  cli/            entry + OpenTUI mount, forceColor
+  agent/          loop, systemPrompt, compaction, skillRouter, backgroundTasks,
+                  toolResultStore, events, mentions, sanitize, tokenAccountant
+  llm/            factory, providers, ollama/openai/anthropic/gemini, retry, probe
+  tools/          shell, http, file, search, web, finding, coverage, ask, todo,
+                  scope, delegate, backgroundStatus, mcp, browserCapture, …
+  ui/             shared state, commands, markdown, clipboard, bridges (no Ink)
+  ui-opentui/     OpenTUI App, ChatPane, Input, modals, StatusBar
+  skills/         registry, discovery, loadSkill, template, validate
+  session/        store
+  coverage/       store
+  findings/       store, report, httpRequest
+  curatedMemory/  # fact store
+  intelligence/   store
+  browser/        store, server, mcpServer
+  config/         config
+  permission/     TieredPrompter
+  redact/         redact
+  logger/         logger, sessionDebug
+  target/         target, scope
+  update/         selfUpdate
+  version/        version
+  ask/            ask prompter interface
 
 skills/           recon webvuln ssrf ssti jwt graphql race takeover
                   supabase deserialize _template README.md
-  ask/            ask.ts (AskPrompter interface satisfied by the TUI)
 
 skills/           recon webvuln ssrf ssti jwt graphql race takeover
                   supabase deserialize _template README.md

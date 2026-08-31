@@ -121,18 +121,22 @@ describe('listModels', () => {
     expect(models.length).toBe(10);
   });
 
-  it('parses Kimi /v1/models with bearer auth', async () => {
+  it('parses Kimi /v1/models with bearer auth and appends unknown ids', async () => {
     const models = await listModels('kimi', `http://127.0.0.1:${port}/v1`, 'sk-kimi');
-    expect(models).toEqual(['kimi-k2.6']);
+    // Curated first, then the rest of the live catalog.
+    expect(models[0]).toBe('kimi-k2.6');
+    expect(models).toContain('gpt-4o-mini');
+    expect(models.length).toBeGreaterThan(1);
   });
 
-  it('parses Groq /openai/v1/models with bearer auth', async () => {
+  it('parses Groq /openai/v1/models with bearer auth and appends unknown ids', async () => {
     const models = await listModels('groq', `http://127.0.0.1:${port}/v1`, 'gsk-fake');
-    expect(models).toEqual([
+    expect(models.slice(0, 3)).toEqual([
       'openai/gpt-oss-120b',
       'openai/gpt-oss-20b',
       'llama-3.3-70b-versatile',
     ]);
+    expect(models).toContain('qwen-coder-32b-instruct');
   });
 
   it('parses OpenRouter /api/v1/models and prepends auto router', async () => {
@@ -144,9 +148,11 @@ describe('listModels', () => {
     ]);
   });
 
-  it('parses DeepSeek /models and prefers current model names', async () => {
+  it('parses DeepSeek /models and prefers V4 ids (legacy chat last if present)', async () => {
     const models = await listModels('deepseek', `http://127.0.0.1:${port}/v1`, 'sk-deepseek');
-    expect(models).toEqual(['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat']);
+    expect(models.slice(0, 2)).toEqual(['deepseek-v4-flash', 'deepseek-v4-pro']);
+    // Live extras (e.g. retired aliases still returned by a stub) stay available.
+    expect(models).toContain('deepseek-chat');
   });
 
   it('parses Gemini models and sorts PentesterFlow recommendations first', async () => {

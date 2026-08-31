@@ -30,6 +30,17 @@ describe('redact.apply', () => {
     expect(out).not.toContain(body);
   });
 
+  it('redacts GitHub fine-grained PATs (github_pat_)', () => {
+    const body = frag('11AAAAAAA0abcdefghijklmnopqrst', 'uvwxyz0123456789ABCDEF');
+    // Freeform (not only Authorization: Bearer) so the github_pat_ pattern runs.
+    const free = apply(frag('token github_pat_', body));
+    expect(free).not.toContain(body);
+    expect(free).toContain('github_pat_');
+    // Also scrubbed when carried as a Bearer value (whole credential masked).
+    const bearer = apply(frag('Authorization: Bearer github_pat_', body));
+    expect(bearer).not.toContain(body);
+  });
+
   it('redacts JWT bodies', () => {
     const sig = frag('SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV', '_adQssw5c');
     const jwt = frag('got jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.', sig);

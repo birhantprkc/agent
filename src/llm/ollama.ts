@@ -8,10 +8,11 @@
 
 import { warn } from '../logger/logger.js';
 import type { Client, Pinger, StreamingClient } from './client.js';
-import { type BackendError, classifyBackend, parseRetryAfter } from './errors.js';
+import { parseContentToolCalls } from './contentToolCalls.js';
+import { BackendError, classifyBackend, parseRetryAfter } from './errors.js';
 import { newCallID } from './ids.js';
-import { withRetry } from './retry.js';
-import type { ChatRequest, ChatResponse, FinishReason, Message, ToolCall } from './types.js';
+import { type RetryInfo, withRetry } from './retry.js';
+import type { ChatRequest, ChatResponse, FinishReason, Message, ToolCall, Usage } from './types.js';
 
 /** Annotate a backend error with the server's Retry-After so withRetry can
  *  honor it instead of its computed backoff. */
@@ -32,6 +33,16 @@ interface OllamaMessage {
   role: string;
   content: string;
   tool_calls?: OllamaToolCall[];
+  // Required on role:'tool' replies so multi-tool turns associate each result
+  // with the matching call. Without this, Ollama mis-pairs parallel tool
+  // results and the agent loop degrades (wrong context for next step).
+  tool_name?: string;
+  // Reasoning models (deepseek-r1, qwen3, gpt-oss, ...) carry their
+  // chain-of-thought here, separate from `content`. We surface it as live
+  // streamed progress (mirrors reasoning_content in openai.ts / thought
+  // parts in gemini.ts) but keep it OUT of the returned message so it never
+  // re-enters the model's history.
+  thinking?: string;
 }
 
 interface OllamaChatResp {
@@ -39,6 +50,15 @@ interface OllamaChatResp {
   done?: boolean;
   /** Why generation stopped: 'stop', 'length' (hit num_predict/num_ctx), ... */
   done_reason?: string;
+  // Only present on the terminal chunk (done:true) in streaming mode; always
+  // present in the single non-streaming response.
+  prompt_eval_count?: number;
+  eval_count?: number;
+}
+
+function toUsage(prompt?: number, completion?: number): Usage | undefined {
+  if (prompt === undefined && completion === undefined) return undefined;
+  return { inputTokens: prompt ?? 0, outputTokens: completion ?? 0 };
 }
 const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
 // Floor for the context window when none is configured. Ollama silently
@@ -59,11 +79,22 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
     numCtx?: number,
     genOpts: { temperature?: number; maxTokens?: number } = {},
   ) {
-    this.baseURL = baseURL || 'http://localhost:11434';
+    // Strip trailing slashes so `${base}/api/chat` never becomes `//api/chat`
+    // (some reverse proxies 404 the double-slash form).
+    this.baseURL = (baseURL || 'http://localhost:11434').replace(/\/+$/, '');
     this.modelID = model;
     this.numCtx = numCtx;
     this.temperature = genOpts.temperature;
     this.maxTokens = genOpts.maxTokens;
+  }
+
+  /** Annotate classifyBackend detail with model + URL so the TUI can tell a
+   *  dead proxy ("endpoint 404") from a missing local pull ("model not found"). */
+  private backendError(status: number, body: string | undefined, path: string): BackendError {
+    const ctx = `model=${this.modelID || '(none)'} url=${this.baseURL}${path}`;
+    const raw = (body ?? '').trim();
+    const detail = raw ? `${raw} (${ctx})` : ctx;
+    return classifyBackend('ollama', null, status, detail);
   }
 
   /** Apply the context window detected at startup (detectOllamaContextWindow).
@@ -84,20 +115,46 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
   async ping(signal?: AbortSignal): Promise<void> {
     try {
       const resp = await fetch(`${this.baseURL}/api/tags`, { method: 'GET', signal });
-      if (resp.status >= 500) {
-        throw new Error(`ollama status ${resp.status}`);
+      // 4xx (esp. empty 404 from a dead RunPod tunnel) must fail health —
+      // previously only >=500 failed, so a 404 proxy still showed "ready".
+      if (resp.status < 200 || resp.status >= 300) {
+        const raw = await resp.text().catch(() => '');
+        const hint = await this.openAICompatHint(signal);
+        throw this.backendError(resp.status, hint ? `${raw} ${hint}`.trim() : raw, '/api/tags');
       }
     } catch (err) {
-      if (err instanceof Error) throw err;
-      throw new Error(String(err));
+      if (err instanceof BackendError) throw err;
+      throw classifyBackend('ollama', err, 0, undefined);
     }
   }
 
-  async chat(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
+  /** Ollama's native /api/tags 404s on endpoints that only speak the
+   *  OpenAI-compat surface (e.g. some RunPod/proxy setups exposing only
+   *  /v1) — that reads as "model missing" or "dead tunnel" with no clue
+   *  what's actually wrong. Best-effort probe /v1/models so the ping error
+   *  can point the user at the fix instead. Never throws — a failed hint
+   *  probe must not mask the original ping failure. */
+  private async openAICompatHint(signal?: AbortSignal): Promise<string | undefined> {
+    try {
+      const resp = await fetch(`${this.baseURL}/v1/models`, { method: 'GET', signal });
+      if (resp.status >= 200 && resp.status < 300) {
+        return '(this endpoint responds on /v1/models — it looks OpenAI-compatible only; switch backend to "openai-compat" instead of "ollama")';
+      }
+    } catch {
+      // Diagnostic only.
+    }
+    return undefined;
+  }
+
+  async chat(
+    req: ChatRequest,
+    signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
+  ): Promise<ChatResponse> {
     // Retry rate limits / transient 5xx with backoff (E7). The non-streaming
     // call has no observable side effects before it returns, so re-running it
     // wholesale is safe.
-    return withRetry(() => this.chatOnce(req, signal), { signal });
+    return withRetry(() => this.chatOnce(req, signal), { signal, onRetry });
   }
 
   private async chatOnce(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
@@ -117,18 +174,19 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
       }
       const raw = await resp.text();
       if (resp.status !== 200) {
-        throw withRetryAfter(classifyBackend('ollama', null, resp.status, raw), resp);
+        throw withRetryAfter(this.backendError(resp.status, raw, '/api/chat'), resp);
       }
       let parsed: OllamaChatResp;
       try {
         parsed = JSON.parse(raw) as OllamaChatResp;
       } catch {
-        throw classifyBackend('ollama', null, resp.status, `invalid JSON from ollama: ${raw}`);
+        throw this.backendError(resp.status, `invalid JSON from ollama: ${raw}`, '/api/chat');
       }
       return this.assembleResponse(
         parsed.message ?? { role: 'assistant', content: '' },
         req.tools,
         parsed.done_reason,
+        toUsage(parsed.prompt_eval_count, parsed.eval_count),
       );
     } finally {
       dispose();
@@ -139,20 +197,27 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
     req: ChatRequest,
     onDelta: (delta: string) => void,
     signal?: AbortSignal,
+    onRetry?: (info: RetryInfo) => void,
   ): Promise<ChatResponse> {
     // Retry only the connection setup (E7): a transient 429/5xx surfaces before
     // any delta is emitted, so re-opening can't double-emit tokens. Once the
     // 200 stream is flowing, a mid-stream failure is NOT retried.
-    const { resp, dispose } = await withRetry(() => this.openStream(req, signal), { signal });
+    const { resp, dispose } = await withRetry(() => this.openStream(req, signal), {
+      signal,
+      onRetry,
+    });
     if (!resp.body) {
       dispose();
       throw new Error('ollama: empty stream body');
     }
 
     let content = '';
+    let thinking = '';
     const toolCalls: OllamaToolCall[] = [];
     let skipped = 0;
     let doneReason: string | undefined;
+    let promptEvalCount: number | undefined;
+    let evalCount: number | undefined;
 
     try {
       for await (const line of iterLines(resp.body)) {
@@ -173,6 +238,13 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
           });
           continue;
         }
+        // Stream reasoning as visible progress (drives the UI off "planning")
+        // but never accumulate it into `content` — the returned message must
+        // stay reasoning-free so it doesn't re-enter the model's history.
+        if (chunk.message?.thinking) {
+          thinking += chunk.message.thinking;
+          onDelta(chunk.message.thinking);
+        }
         if (chunk.message?.content) {
           content += chunk.message.content;
           onDelta(chunk.message.content);
@@ -182,6 +254,8 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
         }
         if (chunk.done) {
           doneReason = chunk.done_reason;
+          promptEvalCount = chunk.prompt_eval_count;
+          evalCount = chunk.eval_count;
           break;
         }
       }
@@ -190,9 +264,10 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
     }
 
     return this.assembleResponse(
-      { role: 'assistant', content, tool_calls: toolCalls },
+      { role: 'assistant', content, tool_calls: toolCalls, thinking },
       req.tools,
       doneReason,
+      toUsage(promptEvalCount, evalCount),
     );
   }
 
@@ -220,7 +295,7 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
       }
       if (resp.status !== 200) {
         const raw = await resp.text();
-        throw withRetryAfter(classifyBackend('ollama', null, resp.status, raw), resp);
+        throw withRetryAfter(this.backendError(resp.status, raw, '/api/chat'), resp);
       }
       return { resp, dispose };
     } catch (err) {
@@ -246,6 +321,12 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
       options,
       messages: req.messages.map((m) => {
         const out: OllamaMessage = { role: m.role, content: m.content };
+        // Ollama's tool-result shape is { role, tool_name, content }. Forward
+        // the name we stored on role:'tool' messages so multi-tool steps
+        // associate results correctly.
+        if (m.role === 'tool' && m.name) {
+          out.tool_name = m.name;
+        }
         if (m.toolCalls?.length) {
           out.tool_calls = m.toolCalls.map((tc) => {
             let args: Record<string, unknown> = {};
@@ -276,13 +357,20 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
     msg: OllamaMessage,
     tools?: ChatRequest['tools'],
     doneReason?: string,
+    usage?: Usage,
   ): ChatResponse {
-    const out: Message = { role: 'assistant', content: msg.content ?? '' };
-    const toolCalls = msg.tool_calls?.length
-      ? msg.tool_calls
-      : parseContentToolCalls(
-          msg.content ?? '',
-          new Set((tools ?? []).map((t) => t.function.name)),
+    const rawContent = msg.content ?? '';
+    // `thinking` is already streamed as live progress (onDelta above) when
+    // present — it must not also land in the returned message's content, or
+    // it re-enters history and gets replayed as context on every later turn.
+    // A reasoning model that exhausts its budget mid-thought can legitimately
+    // produce empty content here; that's an empty turn, not a bug.
+    const out: Message = { role: 'assistant', content: rawContent };
+    const hasNativeToolCalls = Boolean(msg.tool_calls?.length);
+    const toolCalls = hasNativeToolCalls
+      ? (msg.tool_calls ?? [])
+      : parseContentToolCalls(rawContent, new Set((tools ?? []).map((t) => t.function.name))).map(
+          (c) => ({ function: c }),
         );
 
     if (toolCalls.length) {
@@ -294,10 +382,15 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
           arguments: JSON.stringify(tc.function.arguments ?? {}),
         },
       }));
+      // When the tool call was lifted out of the content text (no native
+      // tool_calls), drop the raw JSON so it doesn't leak into the transcript
+      // or get replayed to the provider alongside the structured call.
+      if (!hasNativeToolCalls) out.content = '';
     }
     return {
       message: out,
       finishReason: mapFinishReason(doneReason, Boolean(out.toolCalls?.length)),
+      usage,
     };
   }
 }
@@ -310,107 +403,10 @@ function mapFinishReason(doneReason: string | undefined, hasToolCalls: boolean):
   return hasToolCalls ? 'tool_calls' : 'stop';
 }
 
-function parseContentToolCalls(content: string, knownTools: Set<string>): OllamaToolCall[] {
-  if (knownTools.size === 0) return [];
-
-  const parsed = parseJSONFromContent(content);
-  if (parsed === undefined) return [];
-
-  return normalizeToolCalls(parsed, knownTools);
-}
-
-function parseJSONFromContent(content: string): unknown {
-  const trimmed = content.trim();
-  if (!trimmed) return undefined;
-
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  const candidate = fenced?.[1]?.trim() ?? trimmed;
-  try {
-    return JSON.parse(candidate);
-  } catch {
-    return undefined;
-  }
-}
-
-function normalizeToolCalls(value: unknown, knownTools: Set<string>): OllamaToolCall[] {
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => normalizeToolCalls(item, knownTools));
-  }
-  if (!isRecord(value)) return [];
-
-  const calls =
-    value.tool_calls ??
-    value.toolCalls ??
-    value.tool_call ??
-    value.toolCall ??
-    value.function_call ??
-    value.functionCall;
-  if (isRecord(calls)) {
-    return normalizeToolCalls(calls, knownTools);
-  }
-  if (Array.isArray(calls)) {
-    return calls.flatMap((item) => normalizeToolCalls(item, knownTools));
-  }
-
-  const functionValue = value.function;
-  if (isRecord(functionValue)) {
-    const call = normalizeNamedCall(functionValue.name, functionValue.arguments, knownTools);
-    return call ? [call] : [];
-  }
-  if (typeof functionValue === 'string') {
-    const args = value.arguments ?? value.args ?? value.parameters ?? value.input ?? {};
-    const call = normalizeNamedCall(functionValue, args, knownTools);
-    return call ? [call] : [];
-  }
-
-  const name =
-    value.name ??
-    value.tool ??
-    value.tool_name ??
-    value.toolName ??
-    value.action ??
-    value.action_name ??
-    value.actionName;
-  const args =
-    value.arguments ??
-    value.args ??
-    value.parameters ??
-    value.input ??
-    value.action_input ??
-    value.actionInput ??
-    {};
-  const call = normalizeNamedCall(name, args, knownTools);
-  return call ? [call] : [];
-}
-
-function normalizeNamedCall(
-  nameValue: unknown,
-  argsValue: unknown,
-  knownTools: Set<string>,
-): OllamaToolCall | undefined {
-  if (typeof nameValue !== 'string' || !knownTools.has(nameValue)) return undefined;
-
-  let args: unknown = argsValue;
-  if (typeof args === 'string') {
-    try {
-      args = JSON.parse(args);
-    } catch {
-      args = {};
-    }
-  }
-  const argsRecord = isRecord(args) ? args : {};
-
-  return {
-    function: {
-      name: nameValue,
-      arguments: argsRecord,
-    },
-  };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
+// A broken or malicious proxy streaming a large payload with no newlines
+// would otherwise grow `buffer` without limit (memory exhaustion) — it's
+// only ever appended to between newlines and never capped.
+const MAX_NDJSON_LINE_BYTES = 8 * 1024 * 1024;
 
 /** Decode a byte stream into newline-delimited string chunks. */
 async function* iterLines(body: ReadableStream<Uint8Array>): AsyncIterable<string> {
@@ -427,6 +423,11 @@ async function* iterLines(body: ReadableStream<Uint8Array>): AsyncIterable<strin
         yield buffer.slice(0, idx);
         buffer = buffer.slice(idx + 1);
         idx = buffer.indexOf('\n');
+      }
+      if (buffer.length > MAX_NDJSON_LINE_BYTES) {
+        throw new Error(
+          `ollama stream: line exceeded ${MAX_NDJSON_LINE_BYTES} bytes with no newline`,
+        );
       }
     }
     buffer += decoder.decode();

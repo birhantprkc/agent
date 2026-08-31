@@ -34,6 +34,24 @@ describe('buildSystemPrompt', () => {
     expect(p).not.toContain('Active engagement');
   });
 
+  it('injects the user-profile section when set, omits it when empty', () => {
+    const withProfile = buildSystemPrompt({
+      skills: new Registry(),
+      thinkingEnabled: false,
+      target: null,
+      userProfile: 'prefers terse output\nalways wants a curl repro attached',
+    });
+    expect(withProfile).toContain("What you've learned about the operator");
+    expect(withProfile).toContain('prefers terse output');
+
+    const without = buildSystemPrompt({
+      skills: new Registry(),
+      thinkingEnabled: false,
+      target: null,
+    });
+    expect(without).not.toContain("What you've learned about the operator");
+  });
+
   it('enforces the four-domain scope guard', () => {
     const p = buildSystemPrompt({ skills: new Registry(), thinkingEnabled: false, target: null });
     for (const want of [
@@ -77,6 +95,37 @@ describe('buildSystemPrompt', () => {
     }
   });
 
+  it('carries the new Core Operating Rules and coverage/load_skill discipline', () => {
+    const p = buildSystemPrompt({ skills: new Registry(), thinkingEnabled: false, target: null });
+    for (const want of [
+      'Core Operating Rules',
+      'coverage tool aggressively',
+      'load_skill',
+      'reproduce the exact vulnerable condition yourself',
+      'two different authenticated contexts',
+      'use the `ask` tool',
+      'Tool Results & Observation',
+      'Treat every tool response as ground truth',
+    ]) {
+      expect(p, `missing core rule marker ${want}`).toContain(want);
+    }
+  });
+
+  it('carries long-session/compaction grounding rules against hallucination', () => {
+    const p = buildSystemPrompt({ skills: new Registry(), thinkingEnabled: false, target: null });
+    for (const want of [
+      'Long sessions and compaction',
+      'begins with "ERROR:"',
+      'never invent the output',
+      '[tool output elided mid-turn to fit context]',
+      'LOSSY index',
+      'only in carried state or a prior summary',
+      're-fetch it with a tool',
+    ]) {
+      expect(p, `missing long-session marker ${want}`).toContain(want);
+    }
+  });
+
   it('carries the API Security and LLM OWASP Top 10 frameworks', () => {
     const p = buildSystemPrompt({ skills: new Registry(), thinkingEnabled: false, target: null });
     for (const want of [
@@ -108,6 +157,8 @@ describe('buildSystemPrompt', () => {
     expect(p).toContain('macOS/BSD and Linux');
     expect(p).toContain('grep -P');
     expect(p).toContain('grep -E');
+    // BSD/macOS 255 bounded-repetition cap guidance.
+    expect(p).toContain('maximum repetition exceeds 255');
   });
 
   it("appends the scanner-override stanza when tooling profile is 'full'", () => {
@@ -150,6 +201,16 @@ describe('buildSystemPrompt', () => {
     expect(compact).toContain('OWASP API Top 10');
     expect(compact).toContain('Bugcrowd VRT-style severity');
     expect(compact).not.toContain('Creative hunter mindset');
+    // Compact must still carry the most critical new rules
+    expect(compact).toContain('Core Rules');
+    expect(compact).toContain('coverage');
+    expect(compact).toContain('load_skill');
+    expect(compact).toContain('Reproduce');
+    // ...including the long-session/compaction grounding rules
+    expect(compact).toContain('Long sessions and tool results');
+    expect(compact).toContain('ERROR:');
+    expect(compact).toContain('elided mid-turn');
+    expect(compact).toContain('lossy summary');
     expect(compact.length).toBeLessThan(full.length / 3);
   });
 

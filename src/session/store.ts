@@ -8,9 +8,10 @@
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
-import { chmod, open, rename, unlink } from 'node:fs/promises';
+import { unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { atomicWriteFile } from '../persist/atomicFile.js';
 import { Target } from '../target/target.js';
 
 // ---------- Shared message shape ----------
@@ -142,31 +143,7 @@ export class Store {
     this.saveCount += 1;
     const shouldFsync = this.saveCount === 1 || this.saveCount % FSYNC_EVERY === 0;
 
-    const tmp = `${this.path}.tmp.${randomBytes(3).toString('hex')}`;
-    let fh: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      fh = await open(tmp, 'wx', 0o600);
-      await fh.writeFile(body);
-      if (shouldFsync) await fh.sync();
-      await fh.close();
-      fh = undefined;
-      await rename(tmp, this.path);
-      await chmod(this.path, 0o600).catch(() => undefined);
-    } catch (err) {
-      if (fh) {
-        try {
-          await fh.close();
-        } catch {
-          /* ignore */
-        }
-      }
-      try {
-        await unlink(tmp);
-      } catch {
-        /* ignore */
-      }
-      throw err;
-    }
+    await atomicWriteFile(this.path, body, { mode: 0o600, fsync: shouldFsync });
   }
 
   async clear(): Promise<void> {
@@ -185,32 +162,8 @@ export class Store {
     const dir = dirname(outPath);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const body = markdown.endsWith('\n') ? markdown : `${markdown}\n`;
-    const tmp = `${outPath}.tmp.${randomBytes(3).toString('hex')}`;
-    let fh: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      fh = await open(tmp, 'wx', 0o600);
-      await fh.writeFile(body);
-      await fh.sync();
-      await fh.close();
-      fh = undefined;
-      await rename(tmp, outPath);
-      await chmod(outPath, 0o600).catch(() => undefined);
-      return outPath;
-    } catch (err) {
-      if (fh) {
-        try {
-          await fh.close();
-        } catch {
-          /* ignore */
-        }
-      }
-      try {
-        await unlink(tmp);
-      } catch {
-        /* ignore */
-      }
-      throw err;
-    }
+    await atomicWriteFile(outPath, body, { mode: 0o600, fsync: true });
+    return outPath;
   }
 }
 
@@ -258,7 +211,11 @@ export interface Summary {
   preview: string;
 }
 
-/** List `*.json` sessions in `dir`, newest first. Corrupt files skipped. */
+/** List `*.json` sessions in `dir`, newest first. Corrupt files skipped.
+ *  Limits full parsing to MAX_SESSION_PREVIEW to keep listing fast even with
+ *  thousands of old sessions (previews are only for UI picker). */
+const MAX_SESSION_PREVIEWS = 100;
+
 export function listDir(dir: string): Summary[] {
   if (!existsSync(dir)) return [];
   let entries: string[];
@@ -267,13 +224,25 @@ export function listDir(dir: string): Summary[] {
   } catch {
     return [];
   }
-  const out: Summary[] = [];
+  const candidates: Array<{ name: string; full: string; updatedAt: Date }> = [];
   for (const name of entries) {
     if (!name.endsWith('.json')) continue;
     const full = join(dir, name);
+    // Best-effort mtime from stat without full read for initial sort
+    let mtime = 0;
+    try {
+      mtime = statSync(full).mtimeMs;
+    } catch {
+      /* ignore */
+    }
+    candidates.push({ name, full, updatedAt: new Date(mtime || 0) });
+  }
+  candidates.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+  const out: Summary[] = [];
+  for (const c of candidates.slice(0, MAX_SESSION_PREVIEWS)) {
     let buf: string;
     try {
-      buf = readFileSync(full, 'utf8');
+      buf = readFileSync(c.full, 'utf8');
     } catch {
       continue;
     }
@@ -283,15 +252,16 @@ export function listDir(dir: string): Summary[] {
     } catch {
       continue;
     }
-    const id = raw.id ?? name.replace(/\.json$/, '');
-    const updatedAt = raw.updated_at ? new Date(raw.updated_at) : new Date(0);
+    const id = raw.id ?? c.name.replace(/\.json$/, '');
+    const updatedAt = raw.updated_at ? new Date(raw.updated_at) : c.updatedAt;
     out.push({
       id,
-      path: full,
+      path: c.full,
       updatedAt,
       preview: firstUserPreview(raw.messages ?? [], 80),
     });
   }
+  // If we had more, still return sorted by the parsed updatedAt
   return out.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
 }
 

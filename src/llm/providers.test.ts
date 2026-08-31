@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ANTHROPIC_DEFAULT_MODEL,
+  ANTHROPIC_MODELS,
+  DEEPSEEK_MODELS,
+  GROQ_MODELS,
   KIMI_CONTEXT_WINDOWS,
   KIMI_DEFAULT_MODEL,
   KIMI_MODELS,
+  OPENAI_MODELS,
+  anthropicAcceptsTemperature,
+  backendForScheme,
   kimiAutoCompactThreshold,
   kimiLocksTemperature,
   kimiSupportsThinkingToggle,
@@ -65,5 +72,50 @@ describe('kimiAutoCompactThreshold', () => {
     for (const model of KIMI_MODELS) {
       expect(KIMI_CONTEXT_WINDOWS[model], `missing context window for ${model}`).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('catalog sanity', () => {
+  it('DeepSeek catalog is V4-only (legacy chat/reasoner retired)', () => {
+    expect(DEEPSEEK_MODELS).toEqual(['deepseek-v4-flash', 'deepseek-v4-pro']);
+    expect(DEEPSEEK_MODELS).not.toContain('deepseek-chat');
+    expect(DEEPSEEK_MODELS).not.toContain('deepseek-reasoner');
+  });
+
+  it('Anthropic default is a current Claude 5 id and list includes 4.x + 5.x', () => {
+    expect(ANTHROPIC_DEFAULT_MODEL).toBe('claude-sonnet-5');
+    expect(ANTHROPIC_MODELS).toContain('claude-opus-5');
+    expect(ANTHROPIC_MODELS).toContain('claude-sonnet-4-6');
+  });
+
+  it('Groq curated list prefers gpt-oss and drops retired compound-beta ids', () => {
+    expect(GROQ_MODELS[0]).toBe('openai/gpt-oss-120b');
+    expect(GROQ_MODELS).toContain('groq/compound');
+    expect(GROQ_MODELS).not.toContain('compound-beta');
+    expect(GROQ_MODELS).not.toContain('deepseek-r1-distill-llama-70b');
+  });
+
+  it('anthropicAcceptsTemperature rejects Claude 5 and late Opus 4.x', () => {
+    expect(anthropicAcceptsTemperature('claude-sonnet-5')).toBe(false);
+    expect(anthropicAcceptsTemperature('claude-opus-5')).toBe(false);
+    expect(anthropicAcceptsTemperature('claude-opus-4-8')).toBe(false);
+    expect(anthropicAcceptsTemperature('claude-sonnet-4-6')).toBe(true);
+    expect(anthropicAcceptsTemperature('claude-haiku-4-5')).toBe(true);
+  });
+
+  it('maps custom API schemes to internal backends', () => {
+    expect(backendForScheme('openai')).toBe('openai-compat');
+    expect(backendForScheme('anthropic')).toBe('anthropic');
+  });
+
+  it('OpenAI curated list includes current agentic defaults', () => {
+    expect(OPENAI_MODELS).toContain('gpt-4.1');
+    expect(OPENAI_MODELS).toContain('o3');
+    expect(OPENAI_MODELS).toContain('o4-mini');
+  });
+
+  it('Anthropic list includes Claude 5 + dated Haiku snapshot', () => {
+    expect(ANTHROPIC_MODELS).toContain('claude-fable-5');
+    expect(ANTHROPIC_MODELS).toContain('claude-haiku-4-5-20251001');
   });
 });

@@ -2,12 +2,18 @@
 // component subscribes to only the slice it needs. The agent loop runs
 // outside React and pushes events via dispatch().
 
-import type { AgentEvent } from '../agent/events.js';
+import type { AgentEvent, TodoItem } from '../agent/events.js';
+import { formatUserError } from '../llm/errors.js';
+import { formatChildProgressDetail, formatChildProgressSummary } from '../tools/delegate.js';
 import { displayToolName, formatToolResult, primaryToolArg } from '../tools/toolDisplay.js';
 import type { BannerData } from './Banner.js';
 import type { AskRequest } from './askBridge.js';
 import type { PermissionRequest } from './permBridge.js';
-import { buildToolResultView, shellResultExitStatus } from './toolResultFormat.js';
+import {
+  buildToolResultView,
+  shellResultExitStatus,
+  stripControlSequences,
+} from './toolResultFormat.js';
 
 export interface TranscriptEntry {
   kind:
@@ -18,7 +24,8 @@ export interface TranscriptEntry {
     | 'system'
     | 'error'
     | 'finding'
-    | 'decision';
+    | 'decision'
+    | 'todo';
   text: string;
   /** Set on streaming assistant text so deltas can append in place. While
    *  true and at the tail, this entry renders in the live frame rather
@@ -29,12 +36,17 @@ export interface TranscriptEntry {
    *  be toggled in place. `text` always holds the short preview. */
   collapsible?: boolean;
   fullText?: string;
-  /** Set once the full body has been reprinted so Ctrl-O won't duplicate it. */
+  /** Set once the full body has been reprinted so Ctrl-O won't duplicate it.
+   *  For child-progress lines, toggles in-place expand (Grok-style ↳ list). */
   expanded?: boolean;
   /** Optional display prefix override for entries with custom transcript chrome. */
   prefix?: string;
   /** Optional display color override for entries that need semantic emphasis. */
   color?: string;
+  /** Live child-agent progress row key (`skill:recon`, `explore`, …). */
+  progressKey?: string;
+  /** Ordered tools for a live ↳ progress row (used while updating). */
+  progressTools?: string[];
 }
 
 export type UiPhase =
@@ -70,6 +82,17 @@ export interface AppState {
   /** Display name of the tool currently executing, shown in the busy status
    *  line while phase === 'running-tool'. Set on tool-call, cleared on done. */
   runningTool: string | null;
+  /** Display name of the last tool that finished. Unlike runningTool it
+   *  persists into the idle status line so the user can see what just ran. */
+  lastTool: string | null;
+  /** Count of confirmed findings this session — surfaced in the status line
+   *  so the headline output of an engagement is always visible. Survives
+   *  /clear (which only wipes the on-screen transcript). */
+  findingsCount: number;
+  /** Tighter density: drops the blank spacer row between transcript entries
+   *  and shrinks the banner's padding. Session-scoped only (like --minimal in
+   *  other agent TUIs) — not persisted to config. Toggled by /compact-mode. */
+  compactMode: boolean;
 }
 
 export function initialState(banner: string, bannerData: BannerData): AppState {
@@ -88,6 +111,9 @@ export function initialState(banner: string, bannerData: BannerData): AppState {
     phase: 'idle',
     transcriptFilter: 'all',
     runningTool: null,
+    lastTool: null,
+    findingsCount: 0,
+    compactMode: false,
   };
 }
 
@@ -100,11 +126,22 @@ export type Action =
   | { type: 'set-api-ready'; ready: boolean }
   | { type: 'set-active-skill'; name: string | null }
   | { type: 'set-yolo'; on: boolean }
+  | { type: 'set-compact-mode'; on: boolean }
   | { type: 'set-perm'; req: PermissionRequest | null }
   | { type: 'set-ask'; req: AskRequest | null }
   | { type: 'set-skills-picker'; open: boolean }
   | { type: 'cycle-transcript-filter' }
   | { type: 'expand-tool-output' }
+  /** In-place expand/collapse for collapsible rows (click ↳ progress). */
+  | { type: 'toggle-expand'; index?: number; progressKey?: string; fullText?: string }
+  /** Live ↳ child progress: upsert one row, expandable when done. */
+  | {
+      type: 'child-progress';
+      key: string;
+      label: string;
+      tools: string[];
+      done: boolean;
+    }
   | { type: 'clear' }
   | { type: 'agent-event'; event: AgentEvent };
 
@@ -125,20 +162,11 @@ export function reducer(state: AppState, action: Action): AppState {
       const last = state.transcript[state.transcript.length - 1];
       if (last && last.kind === 'assistant' && last.streaming) {
         // Fresh entry object per token so the live frame sees the new text.
-        // This rebuilds the transcript array (O(N) shallow copy) per token.
-        // We deliberately keep it rather than hoisting the streaming entry
-        // into a dedicated `state.live` field: the live entry no longer pays
-        // the markdown/highlight cost per token (Transcript renders it as
-        // plain text — see plainRowsForEntry), so the shallow array copy is a
-        // cheap O(N) of references, and a `state.live` split would ripple
-        // through every reducer case (assistant-text, done, expand) and the
-        // `transcript.at(-1)` consumers/tests for no meaningful gain.
+        // Use slice()+assign to avoid extra intermediate arrays on every token.
         const updated = { ...last, text: last.text + action.text };
-        return {
-          ...state,
-          phase,
-          transcript: [...state.transcript.slice(0, -1), updated],
-        };
+        const transcript = state.transcript.slice();
+        transcript[transcript.length - 1] = updated;
+        return { ...state, phase, transcript };
       }
       return {
         ...state,
@@ -157,6 +185,8 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, activeSkill: action.name };
     case 'set-yolo':
       return { ...state, yolo: action.on };
+    case 'set-compact-mode':
+      return { ...state, compactMode: action.on };
     case 'set-perm':
       return {
         ...state,
@@ -174,11 +204,8 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'cycle-transcript-filter':
       return { ...state, transcriptFilter: nextTranscriptFilter(state.transcriptFilter) };
     case 'expand-tool-output': {
-      // Reprint the most recent not-yet-expanded collapsible tool-result's
-      // full body as a NEW log entry. Committed scrollback can't be toggled
-      // in place, so "expand" means append. Mark the source `expanded` so a
-      // second Ctrl-O doesn't duplicate it; walk from the tail so Ctrl-O
-      // acts on "the thing I just ran".
+      // Walk from the tail so Ctrl-O acts on "the thing I just ran".
+      // OpenTUI re-renders in place (assistant prose, tool output, ↳ progress).
       let idx = -1;
       for (let i = state.transcript.length - 1; i >= 0; i -= 1) {
         const e = state.transcript[i];
@@ -192,16 +219,111 @@ export function reducer(state: AppState, action: Action): AppState {
       if (!entry) return state;
       const transcript = [...state.transcript];
       transcript[idx] = { ...entry, expanded: true };
-      transcript.push({ kind: 'tool-result', text: entry.fullText ?? entry.text });
       return { ...state, transcript };
+    }
+    case 'toggle-expand': {
+      let idx = action.index ?? -1;
+      if (idx < 0 && action.progressKey) {
+        for (let i = state.transcript.length - 1; i >= 0; i -= 1) {
+          if (state.transcript[i]?.progressKey === action.progressKey) {
+            idx = i;
+            break;
+          }
+        }
+      }
+      if (idx < 0 && action.fullText) {
+        for (let i = state.transcript.length - 1; i >= 0; i -= 1) {
+          const e = state.transcript[i];
+          if (e?.collapsible && e.fullText === action.fullText) {
+            idx = i;
+            break;
+          }
+        }
+      }
+      if (idx < 0) {
+        // Fallback: last collapsible entry.
+        for (let i = state.transcript.length - 1; i >= 0; i -= 1) {
+          if (state.transcript[i]?.collapsible) {
+            idx = i;
+            break;
+          }
+        }
+      }
+      const entry = idx >= 0 ? state.transcript[idx] : undefined;
+      if (!entry?.collapsible || !entry.fullText) return state;
+      const transcript = [...state.transcript];
+      transcript[idx] = { ...entry, expanded: !entry.expanded };
+      return { ...state, transcript };
+    }
+    case 'child-progress': {
+      const { key, label, tools, done } = action;
+      const summary = formatChildProgressSummary(label, tools, done);
+      const collapsible = done && tools.length > 0;
+      // Always keep full tool list for expand (even mid-run if user could expand later).
+      const fullText =
+        tools.length > 0
+          ? formatChildProgressDetail(label, tools)
+          : formatChildProgressSummary(label, tools, done);
+      // Collapsed: one line + click cue once finished with tools.
+      const text = collapsible ? `${summary}  · expand` : summary;
+      let idx = -1;
+      for (let i = state.transcript.length - 1; i >= 0; i -= 1) {
+        if (state.transcript[i]?.progressKey === key) {
+          idx = i;
+          break;
+        }
+      }
+      const prev = idx >= 0 ? state.transcript[idx] : undefined;
+      const expanded = Boolean(prev?.expanded && collapsible);
+      const nextEntry: TranscriptEntry = {
+        kind: 'system',
+        prefix: '↳ ',
+        text,
+        fullText: tools.length > 0 ? fullText : undefined,
+        collapsible: collapsible || undefined,
+        expanded: expanded || undefined,
+        progressKey: key,
+        progressTools: tools.length > 0 ? [...tools] : undefined,
+      };
+      if (idx >= 0) {
+        const transcript = [...state.transcript];
+        transcript[idx] = nextEntry;
+        return { ...state, transcript };
+      }
+      return { ...state, transcript: [...state.transcript, nextEntry] };
     }
     case 'clear':
       // Reset the log and bump clearGen so the Static viewport remounts and
       // stops reprinting the cleared items. Prior output stays in the
       // terminal's native scrollback, like a real shell.
       return { ...state, transcript: [], clearGen: state.clearGen + 1 };
-    case 'agent-event':
-      return applyAgentEvent(state, action.event);
+    case 'agent-event': {
+      const next = applyAgentEvent(state, action.event);
+      // Persist "what just ran" + a running findings tally outside the per-event
+      // logic, so the many tool-result return paths don't each need to thread it.
+      const ev = action.event;
+      if (ev.type === 'tool-result') {
+        // Roll back the optimistic tool-call-time count below when the store
+        // actually rejected the finding (bad/duplicate args) — without this
+        // the "Findings: N" tally in the status bar stays inflated forever
+        // for this tool's headline deliverable.
+        if (ev.name === 'confirm_finding' && ev.err) {
+          return {
+            ...next,
+            lastTool: displayToolName(ev.name),
+            findingsCount: Math.max(0, next.findingsCount - 1),
+          };
+        }
+        return { ...next, lastTool: displayToolName(ev.name) };
+      }
+      // Count a finding once, when its card is first emitted (tool-call), so a
+      // retried/failed save doesn't double-count. Rolled back above if the
+      // matching tool-result comes back with an error.
+      if (ev.type === 'tool-call' && ev.name === 'confirm_finding') {
+        return { ...next, findingsCount: next.findingsCount + 1 };
+      }
+      return next;
+    }
     default: {
       const _exhaustive: never = action;
       void _exhaustive;
@@ -231,26 +353,13 @@ const SHELL_BLOCK_COMMAND_THRESHOLD = 88;
  * spill across the transcript with awkward terminal wrapping.
  */
 function previewArgs(raw: string): string {
-  const oneLine = raw
+  const oneLine = stripControlSequences(raw)
     .replace(/\\[nrt]/g, ' ')
     .replace(/[\r\n\t]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
   if (oneLine.length <= TOOL_CALL_PREVIEW_CAP) return oneLine;
   return `${oneLine.slice(0, TOOL_CALL_PREVIEW_CAP)}…`;
-}
-
-// Renders tool-call args for display. Some tools have a single, obvious
-// argument worth showing bare instead of as raw JSON — e.g. the browser
-// tool's `url`. Falls back to the one-line JSON preview otherwise.
-function previewToolArgs(name: string, raw: string): string {
-  try {
-    const primary = primaryToolArg(name, JSON.parse(raw) as Record<string, unknown>);
-    if (primary !== null) return previewArgs(primary);
-  } catch {
-    // Malformed/partial JSON — fall through to the raw preview.
-  }
-  return previewArgs(raw);
 }
 
 function isShellTool(name: string): boolean {
@@ -311,22 +420,9 @@ function formatFindingCard(argsJSON: string): { text: string; color: string } | 
   return { text: lines.join('\n'), color: severityColor(severity) };
 }
 
-function shellDisplayName(name: string): string {
-  return name === 'shell' ? 'Shell' : 'Bash';
-}
-
 function capText(s: string, max: number): string {
   if (s.length <= max) return s;
   return `${s.slice(0, max)}…`;
-}
-
-function shellCommandFromArgs(argsJSON: string): string | null {
-  try {
-    const parsed = JSON.parse(argsJSON) as Record<string, unknown>;
-    return typeof parsed.command === 'string' && parsed.command ? parsed.command : null;
-  } catch {
-    return null;
-  }
 }
 
 function cleanShellComment(line: string): string {
@@ -446,34 +542,193 @@ function firstShellWord(preview: string): string {
   return withoutAssignments.match(/^[A-Za-z0-9_.:/-]+/)?.[0] ?? 'command';
 }
 
-function formatToolCallText(name: string, argsJSON: string): string {
-  const argsPreview = previewToolArgs(name, argsJSON);
-  if (isShellTool(name)) {
-    const shellName = shellDisplayName(name);
-    const command = shellCommandFromArgs(argsJSON);
-    const action = command
-      ? (shellActionFromCommand(command) ?? shellLongCommandBlock(command))
-      : null;
-    if (action) return `${shellName} · ${action.title}\n$ ${action.command}`;
-    return `${shellName}(${argsPreview})`;
+function parseToolArgs(argsJSON: string): Record<string, unknown> {
+  try {
+    return JSON.parse(argsJSON) as Record<string, unknown>;
+  } catch {
+    return {};
   }
-  if (name === 'ask_user') return `${displayToolName(name)} · ${argsPreview}`;
-  return `${displayToolName(name)} ${argsPreview}`;
 }
 
-/** Short label for the busy status line — the human action, not the raw
- *  command. Shell calls show their inferred title ("HTTP request", "Search
- *  files"); everything else shows the friendly tool name. */
-function runningToolLabel(name: string, argsJSON: string): string {
+function argStr(args: Record<string, unknown>, key: string): string {
+  const v = args[key];
+  return typeof v === 'string' ? v.trim() : '';
+}
+
+/** Short display name for the ⏺ line (Grok-style Title Case). */
+function compactToolLabel(name: string): string {
+  const map: Record<string, string> = {
+    shell: 'Shell',
+    bash: 'Bash',
+    BashTool: 'Bash',
+    scope: 'Scope',
+    http: 'HTTP',
+    file_read: 'Read',
+    FileReadTool: 'Read',
+    file_write: 'Write',
+    FileWriteTool: 'Write',
+    file_edit: 'Edit',
+    FileEditTool: 'Edit',
+    glob: 'Glob',
+    grep: 'Grep',
+    web_fetch: 'Fetch',
+    web_search: 'Search',
+    load_skill: 'Skill',
+    ask_user: 'Ask User',
+    todo: 'Todo',
+    coverage: 'Coverage',
+    confirm_finding: 'Finding',
+    delegate_task: 'Delegate',
+    background_status: 'Jobs',
+  };
+  if (map[name]) return map[name];
+  if (name.startsWith('mcp_browser_browser_')) return 'Browser';
+  const d = displayToolName(name);
+  return d.charAt(0).toUpperCase() + d.slice(1);
+}
+
+/**
+ * Grok-style compact tool call:
+ *   Scope · add
+ *   │ testaspnet.vulnweb.com
+ *   Shell · HTTP request
+ *   $ curl -sS …
+ */
+function compactToolParts(
+  name: string,
+  args: Record<string, unknown>,
+  argsJSON: string,
+): { action: string; detail?: string; detailPrefix?: string } {
   if (isShellTool(name)) {
-    const command = shellCommandFromArgs(argsJSON);
-    const action = command
-      ? (shellActionFromCommand(command) ?? shellLongCommandBlock(command))
-      : null;
-    if (action?.title) return `${shellDisplayName(name)} · ${action.title}`;
-    return shellDisplayName(name);
+    const command = argStr(args, 'command');
+    if (!command) return { action: 'command' };
+    const action = shellActionFromCommand(command) ??
+      shellLongCommandBlock(command) ?? {
+        title: shellTitleFromPreview(previewArgs(command)),
+        command: previewArgs(command),
+      };
+    return { action: action.title, detail: action.command, detailPrefix: '$ ' };
   }
-  return displayToolName(name);
+
+  const key = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '');
+
+  if (key === 'scope') {
+    const action = argStr(args, 'action') || 'list';
+    const pattern = argStr(args, 'pattern');
+    return { action, detail: pattern ? previewArgs(pattern) : undefined };
+  }
+  if (key === 'http') {
+    const method = (argStr(args, 'method') || 'GET').toUpperCase();
+    const url = argStr(args, 'url');
+    return { action: method, detail: url ? previewArgs(url) : undefined };
+  }
+  if (key === 'file_read' || key === 'filereadtool') {
+    return {
+      action: 'file',
+      detail: previewArgs(argStr(args, 'path') || argStr(args, 'file') || ''),
+    };
+  }
+  if (key === 'file_write' || key === 'filewritetool') {
+    return {
+      action: 'write',
+      detail: previewArgs(argStr(args, 'path') || argStr(args, 'file') || ''),
+    };
+  }
+  if (key === 'file_edit' || key === 'fileedittool') {
+    return {
+      action: 'edit',
+      detail: previewArgs(argStr(args, 'path') || argStr(args, 'file') || ''),
+    };
+  }
+  if (key === 'glob') {
+    return {
+      action: 'match',
+      detail: previewArgs(argStr(args, 'pattern') || argStr(args, 'glob') || ''),
+    };
+  }
+  if (key === 'grep') {
+    return {
+      action: 'search',
+      detail: previewArgs(argStr(args, 'pattern') || argStr(args, 'query') || ''),
+    };
+  }
+  if (key === 'web_fetch' || key === 'webfetch') {
+    return { action: 'url', detail: previewArgs(argStr(args, 'url') || '') };
+  }
+  if (key === 'web_search' || key === 'websearch') {
+    return {
+      action: 'query',
+      detail: previewArgs(argStr(args, 'query') || argStr(args, 'q') || ''),
+    };
+  }
+  if (key === 'load_skill' || key === 'loadskill') {
+    const skill = argStr(args, 'name') || 'skill';
+    return { action: args.fork === true ? `${skill} · forked` : skill };
+  }
+  if (key === 'todo') {
+    return { action: argStr(args, 'action') || 'list' };
+  }
+  if (key === 'coverage') {
+    const action = argStr(args, 'action') || 'coverage';
+    const ep = argStr(args, 'endpoint') || argStr(args, 'url');
+    return { action, detail: ep ? previewArgs(ep) : undefined };
+  }
+  if (key === 'delegate_task' || key === 'delegatetask') {
+    return {
+      action: argStr(args, 'role') || 'worker',
+      detail: previewArgs(argStr(args, 'objective') || ''),
+    };
+  }
+  if (key === 'background_status' || key === 'backgroundstatus') {
+    const action = argStr(args, 'action') || 'list';
+    const id = argStr(args, 'id');
+    return { action, detail: id ? previewArgs(id) : undefined };
+  }
+  if (key === 'ask_user' || key === 'askuser' || key === 'ask') {
+    const p = primaryToolArg(name, args);
+    return { action: p ? previewArgs(p) : 'ask' };
+  }
+  if (name.startsWith('mcp_browser_browser_')) {
+    const act = name.replace(/^mcp_browser_browser_/, '').replace(/_/g, ' ');
+    const url = argStr(args, 'url');
+    return { action: act, detail: url ? previewArgs(url) : undefined };
+  }
+
+  const primary = primaryToolArg(name, args);
+  if (primary) return { action: previewArgs(primary) };
+
+  for (const k of ['action', 'name', 'path', 'url', 'query', 'pattern', 'id', 'command']) {
+    const v = argStr(args, k);
+    if (!v) continue;
+    if (k === 'action') return { action: v };
+    return { action: k, detail: previewArgs(v) };
+  }
+
+  const raw = previewArgs(argsJSON);
+  return raw && raw !== '{}' ? { action: raw } : { action: 'run' };
+}
+
+function formatToolCallText(name: string, argsJSON: string): string {
+  const label = compactToolLabel(name);
+  const args = parseToolArgs(argsJSON);
+  const { action, detail, detailPrefix } = compactToolParts(name, args, argsJSON);
+  const head = action ? `${label} · ${action}` : label;
+  if (detail) {
+    const prefix = detailPrefix ?? '│ ';
+    return `${head}\n${prefix}${detail}`;
+  }
+  return head;
+}
+
+/** Short label for the busy status line. */
+function runningToolLabel(name: string, argsJSON: string): string {
+  const label = compactToolLabel(name);
+  const args = parseToolArgs(argsJSON);
+  const { action } = compactToolParts(name, args, argsJSON);
+  return action ? `${label} · ${action}` : label;
 }
 
 function isSuccessfulEmptyShellResult(result: string): boolean {
@@ -517,15 +772,107 @@ function toolResultPrefix(
   return `[ok] ${displayToolName(name)} (${durationMs}ms)`;
 }
 
-function formatCompactEvent(ev: Extract<AgentEvent, { type: 'compact' }>): string {
-  const meta: string[] = [];
-  if (typeof ev.tokensBefore === 'number' && typeof ev.tokensAfter === 'number') {
-    meta.push(`~${ev.tokensBefore} → ~${ev.tokensAfter} tokens`);
+/** Render a todo-tool write as a compact checklist for the transcript. */
+export function formatTodoTranscript(items: TodoItem[]): string {
+  if (items.length === 0) return 'todo list cleared';
+  const glyph = (s: TodoItem['status']): string =>
+    s === 'completed' ? '☑' : s === 'in_progress' ? '▶' : '☐';
+  return items.map((i) => `${glyph(i.status)} ${i.text}`).join('\n');
+}
+
+/**
+ * Quiet decision / context-guard lines for the transcript.
+ * Legacy long "decision planner: selected skill: …" strings are collapsed.
+ */
+export function formatDecisionTranscript(summary: string): string {
+  const s = (summary ?? '').trim();
+  if (!s) return 'plan';
+  if (s.startsWith('context guard:')) {
+    return s.replace(/^context guard:\s*/i, 'context · ');
   }
-  if (typeof ev.memoryItems === 'number') meta.push(`${ev.memoryItems} memory items`);
-  return meta.length > 0
-    ? `compacted: ${ev.summary}\n${meta.join(' · ')}`
-    : `compacted: ${ev.summary}`;
+  // Already short (new agent format).
+  if (/^plan · /i.test(s)) return s;
+  const skill = s.match(/selected skill:\s*([^·]+)/i)?.[1]?.trim();
+  const risk = s.match(/risk:\s*(\w+)/i)?.[1]?.toLowerCase();
+  if (skill) {
+    return risk === 'high' ? `plan · ${skill} · high risk` : `plan · ${skill}`;
+  }
+  if (s.length <= 64) return s;
+  return `${s.slice(0, 61)}…`;
+}
+
+/**
+ * Claude/Grok-style compact notice: one quiet system line.
+ * Never dump "triggered…", the LLM summary body, or a second meta line.
+ */
+export function formatCompactEvent(ev: Extract<AgentEvent, { type: 'compact' }>): string {
+  const s = (ev.summary ?? '').trim();
+  if (!s || /^nothing to compact$/i.test(s)) return 'Nothing to compact';
+
+  const parts: string[] = [];
+  if (typeof ev.tokensBefore === 'number' && typeof ev.tokensAfter === 'number') {
+    parts.push(`~${ev.tokensBefore} → ~${ev.tokensAfter} tokens`);
+  }
+  // Skip "0 memory items" noise.
+  if (typeof ev.memoryItems === 'number' && ev.memoryItems > 0) {
+    parts.push(`${ev.memoryItems} memory`);
+  }
+
+  // Operational auto-compact / short labels from the agent.
+  if (
+    /^context compacted$/i.test(s) ||
+    /^auto-compact/i.test(s) ||
+    /^compacted:/i.test(s) ||
+    s.length <= 64
+  ) {
+    return parts.length > 0 ? `Context compacted · ${parts.join(' · ')}` : 'Context compacted';
+  }
+
+  // Legacy: a long summary string used to be the LLM body — keep the UI short.
+  return parts.length > 0 ? `Context compacted · ${parts.join(' · ')}` : 'Context compacted';
+}
+
+/**
+ * Collapse long assistant prose (Grok-style): short head stays visible,
+ * full body is behind click / Ctrl-O expand. Short replies pass through.
+ */
+export function collapseAssistantProse(text: string): {
+  preview: string;
+  full: string;
+  collapsible: boolean;
+} {
+  const full = stripControlSequences(text).replace(/\r\n/g, '\n').trimEnd();
+  if (!full) return { preview: full, full, collapsible: false };
+  const lines = full.split('\n');
+  const HEAD = 5;
+  const LINE_THRESHOLD = 7;
+  const CHAR_THRESHOLD = 480;
+  if (lines.length <= LINE_THRESHOLD && full.length <= CHAR_THRESHOLD) {
+    return { preview: full, full, collapsible: false };
+  }
+  let head = lines.slice(0, HEAD).join('\n');
+  if (head.length > CHAR_THRESHOLD) head = `${head.slice(0, CHAR_THRESHOLD)}…`;
+  const shown = head.split('\n').length;
+  const hidden = Math.max(0, lines.length - shown);
+  const cue =
+    hidden > 0
+      ? `… ${hidden} more line${hidden === 1 ? '' : 's'} · click to expand`
+      : '… · click to expand';
+  return { preview: `${head}\n${cue}`, full, collapsible: true };
+}
+
+function finalizeAssistantEntry(entry: TranscriptEntry): TranscriptEntry {
+  const body = entry.text ?? '';
+  const c = collapseAssistantProse(body);
+  if (!c.collapsible) return { ...entry, streaming: false };
+  return {
+    ...entry,
+    streaming: false,
+    text: c.preview,
+    fullText: c.full,
+    collapsible: true,
+    expanded: false,
+  };
 }
 
 function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
@@ -534,7 +881,11 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
       // Finalize any active stream entry, or append a fresh one.
       const last = state.transcript[state.transcript.length - 1];
       if (last && last.kind === 'assistant' && last.streaming) {
-        const finalized: TranscriptEntry = { ...last, streaming: false };
+        // Prefer the completed event body when present (non-stream path);
+        // otherwise collapse whatever streamed into `last`.
+        const base: TranscriptEntry =
+          ev.text && ev.text.length > 0 ? { ...last, text: ev.text } : last;
+        const finalized = finalizeAssistantEntry(base);
         return {
           ...state,
           phase: 'answering',
@@ -544,7 +895,10 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
       return {
         ...state,
         phase: 'answering',
-        transcript: [...state.transcript, { kind: 'assistant', text: ev.text }],
+        transcript: [
+          ...state.transcript,
+          finalizeAssistantEntry({ kind: 'assistant', text: ev.text }),
+        ],
       };
     }
     case 'assistant-delta':
@@ -574,7 +928,8 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
           {
             kind: 'tool-call',
             text: formatToolCallText(ev.name, ev.argsJSON),
-            prefix: isShellTool(ev.name) ? '⏺ ' : undefined,
+            // ROLE_STYLES already uses ⏺ for tool-call; keep explicit for clarity.
+            prefix: '⏺ ',
             color: toolCallColor(ev.name),
           },
         ],
@@ -667,7 +1022,14 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
       return {
         ...state,
         phase: state.busy ? 'answering' : state.phase,
-        transcript: [...state.transcript, { kind: 'error', text: ev.err.message }],
+        transcript: [
+          ...state.transcript,
+          {
+            kind: 'error',
+            // Friendly multi-line copy for BackendError (ollama 404, down, …).
+            text: stripControlSequences(formatUserError(ev.err)),
+          },
+        ],
       };
     case 'compact':
       return {
@@ -679,7 +1041,16 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
       return {
         ...state,
         phase: 'planning',
-        transcript: [...state.transcript, { kind: 'decision', text: ev.summary }],
+        // Keep mid-turn context-guard notices; planner lines are already short.
+        transcript: [
+          ...state.transcript,
+          { kind: 'decision', text: formatDecisionTranscript(ev.summary) },
+        ],
+      };
+    case 'todo':
+      return {
+        ...state,
+        transcript: [...state.transcript, { kind: 'todo', text: formatTodoTranscript(ev.items) }],
       };
     case 'skill-active':
       return { ...state, activeSkill: ev.name };
@@ -691,12 +1062,45 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
           { kind: 'system', text: `recalled memory: ${ev.names.join(', ')}` },
         ],
       };
+    case 'retry':
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript,
+          {
+            kind: 'system',
+            text: `⟳ ${ev.message} — retrying in ${(ev.delayMs / 1000).toFixed(1)}s (attempt ${ev.attempt})`,
+          },
+        ],
+      };
+    case 'subagent-progress': {
+      // Upsert expandable ↳ progress (accumulate tools on the existing row).
+      const key = ev.role;
+      let tools: string[] = [];
+      for (let i = state.transcript.length - 1; i >= 0; i -= 1) {
+        const e = state.transcript[i];
+        if (e?.progressKey === key) {
+          tools = e.progressTools ? [...e.progressTools] : [];
+          break;
+        }
+      }
+      if (ev.phase === 'tool' && ev.tool) tools.push(ev.tool);
+      const label = key.startsWith('skill:') ? key.slice('skill:'.length) || 'skill' : key;
+      return reducer(state, {
+        type: 'child-progress',
+        key,
+        label,
+        tools,
+        done: ev.phase === 'done',
+      });
+    }
     case 'done': {
       // End of turn: finalize a trailing streaming assistant entry so it
       // moves out of the live frame and into the committed scrollback log.
+      // Long replies collapse for Grok-style click-to-expand.
       const last = state.transcript[state.transcript.length - 1];
       if (last && last.kind === 'assistant' && last.streaming) {
-        const finalized: TranscriptEntry = { ...last, streaming: false };
+        const finalized = finalizeAssistantEntry(last);
         return {
           ...state,
           busy: false,

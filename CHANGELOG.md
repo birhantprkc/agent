@@ -8,37 +8,43 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
-- **Saved memory (`#` quick-add)** — a curated, human-readable memory layer
-  modeled on Claude Code. `#<text>` saves a durable fact (one Markdown file per
-  fact with frontmatter, under `.pentesterflow/memory/`); `#!<text>` saves it to
-  the personal scope. The fact catalog is pinned into the system prompt every
-  turn (survives compaction) and the most relevant facts are recalled in full
-  per turn, surfaced as a `recalled memory: …` line. Manage with
-  `/memory add|list|forget`. Secrets are redacted before write.
-- **Parallel tool dispatch** — independent tool calls in one step now run
-  concurrently (bounded fan-out) with results recorded in call order; recon
-  fan-outs finish in ~max(latency) instead of the sum. Single-call and
-  `load_skill` steps stay sequential. The permission prompter serializes its
-  modal so approvals still appear one at a time.
-- **LLM retry/backoff** — transient backend failures (HTTP 429 / 502 / 503 /
-  504 and connection drops) are retried with exponential backoff, honoring a
-  `Retry-After` header. Applied to the OpenAI-compatible client (Kimi, Groq,
-  OpenRouter, DeepSeek, LM Studio).
+- **OpenTUI-only terminal UI** — full-width chat, app-owned scroll,
+  click-to-expand tool output and subagent progress, calm status chrome.
+  Ink path and left sidebar removed.
+- **Permission tiers** — `/mode ask|auto-safe|yolo` plus plan/act work mode;
+  auto-safe auto-approves observational tools only.
+- **Delegates & skill forks** — `delegate_task` (worker/explore) and
+  `load_skill fork=true` for compressed child-agent runs; expandable `↳`
+  progress lines.
+- **Background shell jobs** — `shell(background=true)`, `background_status`,
+  `/jobs`, completion notices.
+- **Context hygiene** — microcompact before LLM compact, pinned session memory,
+  off-transcript storage for huge tool results, quiet skill router.
+- **Auto-continue** — per-turn tool budget quietly continues (no Max Steps modal).
+- **Clipboard** — robust paste (bracketed + Cmd/Ctrl+V host clipboard) and copy
+  (OSC 52 + host clipboard fallback).
+- **Saved memory (`#` quick-add)** — curated facts under `.pentesterflow/memory/`;
+  catalog pinned into the system prompt; manage with `/memory`.
+- **Parallel tool dispatch** — independent tool calls in one step run
+  concurrently (bounded); permission prompts stay serialized.
+- **LLM retry/backoff** — 429/5xx and connection drops with exponential backoff
+  and `Retry-After` support (OpenAI-compatible clients).
 
 ### Changed
 
-- **Self-update hardening** — a pinned `pentesterflow update <version>` now
-  fetches the installer from that release tag (immutable) instead of `main`, and
-  the installer URL is asserted to be https on `raw.githubusercontent.com`
-  before fetch.
+- **Self-update hardening** — versioned updates pin the installer to the release
+  tag (immutable) on `raw.githubusercontent.com`.
+- **Production copy** — quieter empty state, status phases, expand cues, and
+  first-run setup labels.
 
 ### Fixed
 
-- **Redaction gaps** — connection-string query-param credentials
-  (`?password=` / `&auth=` / `&access_token=`), HTTP Digest `response=` hashes,
-  and GCP service-account `private_key_id` are now masked.
+- **Redaction gaps** — connection-string query-param credentials, HTTP Digest
+  `response=` hashes, and GCP service-account `private_key_id` are masked.
 - Closed out the internal code audit: 35 of 39 findings fixed, 3 accepted as
   intentional, 1 hardened (see `AUDIT.md`).
+- **Copy/paste** under OpenTUI alternate screen (renderer OSC 52 + system
+  clipboard fallback).
 
 ## [0.2.0] - 2026-06-06
 
