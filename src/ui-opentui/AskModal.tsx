@@ -102,11 +102,10 @@ export function AskModal({ req }: { req: AskRequest }) {
         borderStyle: 'rounded',
         borderColor: theme.border.focus,
         flexDirection: 'column',
-        alignSelf: 'flex-start',
+        alignSelf: 'center',
         minWidth: 56,
         paddingX: 2,
         paddingY: 1,
-        marginTop: 1,
       }}
     >
       <box style={{ flexDirection: 'column' }}>

@@ -986,6 +986,8 @@ export function App({
           maxHeight: hasModal || hasPerm ? footerReserved : undefined,
           overflow: 'hidden',
           width: chatWidth,
+          justifyContent: 'center',
+          alignItems: 'center',
         }}
       >
         {secretInput ? (

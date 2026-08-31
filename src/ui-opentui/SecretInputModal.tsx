@@ -65,11 +65,10 @@ export function SecretInputModal({ req }: { req: SecretInputRequest }) {
         borderStyle: 'rounded',
         borderColor: theme.border.focus,
         flexDirection: 'column',
-        alignSelf: 'flex-start',
+        alignSelf: 'center',
         minWidth: 48,
         paddingX: 2,
         paddingY: 1,
-        marginTop: 1,
       }}
     >
       <box style={{ flexDirection: 'column' }}>

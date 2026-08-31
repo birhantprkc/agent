@@ -120,10 +120,9 @@ export function SkillsModal({ agent, persistDisabledSkills, onClose }: SkillsMod
           borderStyle: 'rounded',
           borderColor: theme.border.focus,
           flexDirection: 'column',
-          alignSelf: 'flex-start',
+          alignSelf: 'center',
           paddingX: 2,
           paddingY: 1,
-          marginTop: 1,
         }}
       >
         <box style={{ flexDirection: 'row' }}>
@@ -152,10 +151,9 @@ export function SkillsModal({ agent, persistDisabledSkills, onClose }: SkillsMod
         borderStyle: 'rounded',
         borderColor: theme.border.focus,
         flexDirection: 'column',
-        alignSelf: 'flex-start',
+        alignSelf: 'center',
         paddingX: 2,
         paddingY: 1,
-        marginTop: 1,
       }}
     >
       <box style={{ flexDirection: 'row', justifyContent: 'space-between' }}>

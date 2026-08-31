@@ -38,11 +38,10 @@ export function MenuFrame({
         border: true,
         borderStyle: 'rounded',
         borderColor: theme.border.focus,
-        alignSelf: 'flex-start',
+        alignSelf: 'center',
         minWidth,
         paddingX: 1,
         paddingY: 0,
-        marginTop: 0,
       }}
     >
       <box style={{ flexDirection: 'column', paddingX: 1, paddingTop: 0 }}>
