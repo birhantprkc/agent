@@ -1,9 +1,4 @@
 /** @jsxImportSource @opentui/react */
-// Bounded, app-owned chat viewport. Physical-row windowing via wrapRows.ts;
-// mouse wheel via onMouseScroll; scroll cue when history is above the
-// viewport; empty-state guidance when the log is empty.
-
-import { userInfo } from 'node:os';
 import { TextAttributes } from '@opentui/core';
 import { useMemo } from 'react';
 import {
@@ -17,17 +12,6 @@ import { theme } from '../ui/theme.js';
 import { Banner, type BannerData } from './Banner.js';
 import { type AnsiSpan, ansiToSpans, stripAnsi } from './ansiSpans.js';
 import { wrapRowsToWidth } from './wrapRows.js';
-
-/** Local login name for the empty-state greeting (macOS/Linux USER). */
-function machineUsername(): string {
-  try {
-    const n = userInfo().username?.trim();
-    if (n) return n;
-  } catch {
-    /* restricted environments */
-  }
-  return process.env.USER?.trim() || process.env.LOGNAME?.trim() || 'Hacker';
-}
 
 export interface ChatPaneProps {
   committed: TranscriptEntry[];
@@ -122,8 +106,6 @@ function spanAttributes(span: AnsiSpan, baseDim: boolean): number | undefined {
   return attrs || undefined;
 }
 
-const EMPTY_GREETING = () => `🧑‍💻 Hello ${machineUsername()}, Let's Pwn The World`;
-
 export function ChatPane({
   committed,
   liveEntry,
@@ -195,49 +177,43 @@ export function ChatPane({
             </text>
           </box>
         ) : null}
-        {isEmpty ? (
-          <box style={{ flexDirection: 'row', marginTop: 1 }}>
-            <text fg={theme.text} attributes={TextAttributes.BOLD}>
-              {EMPTY_GREETING()}
-            </text>
-          </box>
-        ) : (
-          visible.map((row) => {
-            const line = (
-              <text>
-                {row.spans.map((span, i) => (
-                  <span
-                    // biome-ignore lint/suspicious/noArrayIndexKey: spans derived fresh each render
-                    key={i}
-                    fg={span.fg ?? row.baseColor}
-                    bg={span.bg}
-                    attributes={spanAttributes(span, row.baseDim)}
+        {isEmpty
+          ? null
+          : visible.map((row) => {
+              const line = (
+                <text>
+                  {row.spans.map((span, i) => (
+                    <span
+                      // biome-ignore lint/suspicious/noArrayIndexKey: spans derived fresh each render
+                      key={i}
+                      fg={span.fg ?? row.baseColor}
+                      bg={span.bg}
+                      attributes={spanAttributes(span, row.baseDim)}
+                    >
+                      {span.text}
+                    </span>
+                  ))}
+                </text>
+              );
+              // Clickable ↳ progress / collapsible tool rows (Grok-style expand).
+              const source = row.sourceEntry as TranscriptEntry | undefined;
+              if (source && onToggleExpand) {
+                return (
+                  <box
+                    key={row.key}
+                    style={{ flexDirection: 'row' }}
+                    onMouseDown={() => onToggleExpand(source)}
                   >
-                    {span.text}
-                  </span>
-                ))}
-              </text>
-            );
-            // Clickable ↳ progress / collapsible tool rows (Grok-style expand).
-            const source = row.sourceEntry as TranscriptEntry | undefined;
-            if (source && onToggleExpand) {
+                    {line}
+                  </box>
+                );
+              }
               return (
-                <box
-                  key={row.key}
-                  style={{ flexDirection: 'row' }}
-                  onMouseDown={() => onToggleExpand(source)}
-                >
+                <box key={row.key} style={{ flexDirection: 'row' }}>
                   {line}
                 </box>
               );
-            }
-            return (
-              <box key={row.key} style={{ flexDirection: 'row' }}>
-                {line}
-              </box>
-            );
-          })
-        )}
+            })}
         {unseenBelow && showScrollCue ? (
           <box style={{ flexDirection: 'row' }}>
             <text fg={theme.focus} attributes={TextAttributes.BOLD}>

@@ -7,7 +7,9 @@
 
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { apply as redact } from '../redact/redact.js';
 import type { TranscriptEntry } from './state.js';
+import { stripControlSequences } from './toolResultFormat.js';
 import { normalizePastedText, stripPasteMarkers } from './useTextField.js';
 
 const execFileAsync = promisify(execFile);
@@ -185,8 +187,8 @@ export function lastCopyableOutput(entries: TranscriptEntry[]): string | null {
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const e = entries[i];
     if (!e) continue;
-    if (e.kind === 'tool-result') return e.fullText ?? e.text;
-    if (e.kind === 'finding') return e.text;
+    if (e.kind === 'tool-result') return redact(stripControlSequences(e.fullText ?? e.text));
+    if (e.kind === 'finding') return redact(stripControlSequences(e.text));
   }
   return null;
 }

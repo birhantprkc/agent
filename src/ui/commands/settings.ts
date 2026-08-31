@@ -8,6 +8,7 @@ import {
   formatConfig,
   load,
 } from '../../config/config.js';
+import { apply as redact } from '../../redact/redact.js';
 import type { SlashContext } from './context.js';
 
 export function handleTarget(ctx: SlashContext): void {
@@ -135,7 +136,7 @@ export function handleConfig(ctx: SlashContext): void {
   const full = defaultConfig();
   full.backend = live.backend;
   full.model = live.model;
-  full.base_url = live.baseURL;
+  full.base_url = redact(live.baseURL);
   full.api_key = live.apiKey;
   if (live.customModels) full.custom_models = [...live.customModels];
 

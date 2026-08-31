@@ -45,8 +45,7 @@ async function renderFrame(node: Parameters<typeof testRender>[0], width = 80): 
 describe('Banner', () => {
   it('renders a small mini PF monogram plus meta', async () => {
     const frame = await renderFrame(<Banner data={base} width={80} />, 80);
-    // Mini figlet "PF" (first glyph row).
-    expect(frame).toContain('_');
+    expect(frame).toContain('█▀█');
     expect(frame).toContain('PentesterFlow');
     expect(frame).toContain('v0.1.0-dev');
     expect(frame).toContain('ollama');
@@ -66,7 +65,7 @@ describe('Banner', () => {
     expect(ok).not.toContain('tools ready');
 
     const bad = await renderFrame(<Banner data={{ ...base, toolSupport: 'no' }} width={80} />, 80);
-    expect(bad).toContain('no tools');
+    expect(bad).toContain('NO TOOLS');
   });
 
   it('does not surface endpoint or session status', async () => {

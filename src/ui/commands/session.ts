@@ -6,7 +6,7 @@ import type { Agent } from '../../agent/agent.js';
 import type { Backend } from '../../config/config.js';
 import { chalkLevel } from '../colorLevel.js';
 import { SLASH_ITEMS } from '../slashItems.js';
-import type { SlashContext } from './context.js';
+import { type SlashContext, confirmDestructive } from './context.js';
 
 export function handleExit(ctx: SlashContext): void {
   ctx.exit();
@@ -114,10 +114,17 @@ export function handleReset(ctx: SlashContext): void {
     });
     return;
   }
-  void ctx.agent.reset();
-  ctx.clearScreen();
-  ctx.dispatch({ type: 'clear' });
-  ctx.dispatch({ type: 'append', entry: { kind: 'system', text: 'conversation reset' } });
+  confirmDestructive(
+    ctx,
+    'Reset this conversation?',
+    'Conversation history and saved session will be cleared.',
+    () => {
+      void ctx.agent.reset();
+      ctx.clearScreen();
+      ctx.dispatch({ type: 'clear' });
+      ctx.dispatch({ type: 'append', entry: { kind: 'system', text: 'conversation reset' } });
+    },
+  );
 }
 
 export function handleHelp(ctx: SlashContext): void {

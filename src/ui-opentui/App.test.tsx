@@ -191,6 +191,15 @@ describe('App (OpenTUI)', () => {
     expect(frame).toContain('COMMANDS');
   });
 
+  it('opens the provider picker when selecting /provider from the slash menu', async () => {
+    const setup = await mountApp();
+    await pressAndFlush(setup, () => setup.mockInput.typeText('/'));
+    await pressAndFlush(setup, () => setup.mockInput.pressArrow('down'));
+    await pressAndFlush(setup, () => setup.mockInput.pressEnter());
+    const frame = setup.captureCharFrame();
+    expect(frame).toContain('Select an LLM provider for this session');
+  });
+
   it('surfaces a permission request published through bindPermPublisher as a modal', async () => {
     let publish: ((req: unknown) => void) | undefined;
     const setup = await mountApp({

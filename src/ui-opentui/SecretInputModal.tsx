@@ -11,7 +11,7 @@
 //     handles pasting an API key (the primary real-world use of this modal).
 
 import { TextAttributes } from '@opentui/core';
-import { useKeyboard, usePaste } from '@opentui/react';
+import { useKeyboard, usePaste, useTerminalDimensions } from '@opentui/react';
 import { useState } from 'react';
 import { decodePasteEvent } from '../ui/clipboard.js';
 import type { SecretInputRequest } from '../ui/secretInput.js';
@@ -29,6 +29,7 @@ function stripControlChars(s: string): string {
 }
 
 export function SecretInputModal({ req }: { req: SecretInputRequest }) {
+  const { width: columns } = useTerminalDimensions();
   const [value, setValue] = useState('');
 
   useKeyboard((e) => {
@@ -66,7 +67,7 @@ export function SecretInputModal({ req }: { req: SecretInputRequest }) {
         borderColor: theme.border.focus,
         flexDirection: 'column',
         alignSelf: 'center',
-        minWidth: 48,
+        width: Math.max(20, Math.min(columns - 2, 80)),
         paddingX: 2,
         paddingY: 1,
       }}
@@ -92,7 +93,7 @@ export function SecretInputModal({ req }: { req: SecretInputRequest }) {
           borderStyle: 'rounded',
           borderColor: empty ? theme.border.idle : theme.border.focus,
           paddingX: 1,
-          minWidth: 40,
+          width: '100%',
           flexDirection: 'row',
         }}
       >

@@ -19,6 +19,7 @@ dist/
 *.swp
 .playwright-mcp/
 .grok/
+.omo/
 
 # Agent harness configs (may contain target hosts / secrets)
 .claude/

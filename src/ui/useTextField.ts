@@ -14,6 +14,7 @@
 //     re-typing the tail.
 
 import { useCallback, useReducer } from 'react';
+import { cellWidth, graphemes } from './terminalWidth.js';
 
 export interface TextFieldState {
   value: string;
@@ -55,20 +56,25 @@ function reducer(s: TextFieldState, a: Action): TextFieldState {
     }
     case 'backspace': {
       if (s.cursor === 0) return s;
+      const start = previousBoundary(s.value, s.cursor);
       return {
-        value: s.value.slice(0, s.cursor - 1) + s.value.slice(s.cursor),
-        cursor: s.cursor - 1,
+        value: s.value.slice(0, start) + s.value.slice(s.cursor),
+        cursor: start,
       };
     }
     case 'delete': {
       if (s.cursor >= s.value.length) return s;
+      const end = nextBoundary(s.value, s.cursor);
       return {
-        value: s.value.slice(0, s.cursor) + s.value.slice(s.cursor + 1),
+        value: s.value.slice(0, s.cursor) + s.value.slice(end),
         cursor: s.cursor,
       };
     }
     case 'move':
-      return { ...s, cursor: clamp(s.cursor + a.delta, 0, s.value.length) };
+      return {
+        ...s,
+        cursor: a.delta < 0 ? previousBoundary(s.value, s.cursor) : nextBoundary(s.value, s.cursor),
+      };
     case 'move-up': {
       const { line, col } = positionOf(s.value, s.cursor);
       if (line === 0) return { ...s, cursor: 0 };
@@ -139,13 +145,16 @@ export function positionOf(value: string, offset: number): { line: number; col: 
   let line = 0;
   let col = 0;
   const cap = clamp(offset, 0, value.length);
-  for (let i = 0; i < cap; i += 1) {
-    if (value[i] === '\n') {
+  let cursor = 0;
+  for (const grapheme of graphemes(value)) {
+    if (cursor >= cap) break;
+    if (grapheme === '\n') {
       line += 1;
       col = 0;
     } else {
-      col += 1;
+      col += cellWidth(grapheme);
     }
+    cursor += grapheme.length;
   }
   return { line, col };
 }
@@ -156,8 +165,34 @@ export function offsetAt(value: string, line: number, col: number): number {
   const targetLine = clamp(line, 0, lines.length - 1);
   let off = 0;
   for (let i = 0; i < targetLine; i += 1) off += (lines[i] ?? '').length + 1;
-  const lineLen = (lines[targetLine] ?? '').length;
-  return off + clamp(col, 0, lineLen);
+  let used = 0;
+  for (const grapheme of graphemes(lines[targetLine] ?? '')) {
+    const width = cellWidth(grapheme);
+    if (used + width > col) break;
+    used += width;
+    off += grapheme.length;
+  }
+  return off;
+}
+
+function previousBoundary(value: string, offset: number): number {
+  let cursor = 0;
+  let previous = 0;
+  for (const grapheme of graphemes(value)) {
+    if (cursor >= offset) break;
+    previous = cursor;
+    cursor += grapheme.length;
+  }
+  return previous;
+}
+
+function nextBoundary(value: string, offset: number): number {
+  let cursor = 0;
+  for (const grapheme of graphemes(value)) {
+    cursor += grapheme.length;
+    if (cursor > offset) return cursor;
+  }
+  return value.length;
 }
 
 function clamp(n: number, lo: number, hi: number): number {

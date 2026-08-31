@@ -34,6 +34,9 @@ All notable changes to this project are documented here. The format is based on
 
 - **Self-update hardening** — versioned updates pin the installer to the release
   tag (immutable) on `raw.githubusercontent.com`.
+- **Release metadata** — synchronized npm dependency metadata with the Bun
+  package graph and documented Bun as the supported development package
+  manager.
 - **Production copy** — quieter empty state, status phases, expand cues, and
   first-run setup labels.
 

@@ -11,6 +11,7 @@
 // Measurement is character-count (not east-asian fullwidth / emoji width):
 // tool output and assistant prose are overwhelmingly ASCII.
 
+import { cellWidth, graphemes } from '../ui/terminalWidth.js';
 import type { AnsiSpan } from './ansiSpans.js';
 
 export interface WrappableRow {
@@ -30,7 +31,7 @@ export function wrapRowToWidth(row: WrappableRow, width: number): WrappableRow[]
   const hang = Math.max(0, Math.min(row.hangIndent ?? 0, w - 1));
   const plain = row.spans.map((s) => s.text).join('');
   if (plain.length === 0) return [row];
-  if (!plain.includes('\n') && plain.length <= w) return [row];
+  if (!plain.includes('\n') && cellWidth(plain) <= w) return [row];
 
   const out: WrappableRow[] = [];
   let lineSpans: AnsiSpan[] = [];
@@ -77,14 +78,19 @@ export function wrapRowToWidth(row: WrappableRow, width: number): WrappableRow[]
       if (lineLen >= budget) flush();
       const room = lineBudget() - lineLen;
       let take = 0;
-      while (take < room && i + take < text.length && text[i + take] !== '\n') {
-        take += 1;
+      let consumed = 0;
+      for (const grapheme of graphemes(text.slice(i))) {
+        if (grapheme === '\n' || take + cellWidth(grapheme) > room) break;
+        take += cellWidth(grapheme);
+        consumed += grapheme.length;
       }
       if (take === 0) {
-        flush();
-        continue;
+        const first = graphemes(text.slice(i))[0];
+        if (!first) break;
+        consumed = first.length;
+        take = Math.max(1, cellWidth(first));
       }
-      const piece = text.slice(i, i + take);
+      const piece = text.slice(i, i + consumed);
       lineSpans.push({
         text: piece,
         fg: span.fg,
@@ -95,7 +101,7 @@ export function wrapRowToWidth(row: WrappableRow, width: number): WrappableRow[]
         underline: span.underline,
       });
       lineLen += take;
-      i += take;
+      i += consumed;
     }
   }
   if (lineSpans.length > 0 || out.length === 0) flush();

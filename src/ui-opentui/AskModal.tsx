@@ -11,13 +11,13 @@
 // `attributes={TextAttributes.BOLD | TextAttributes.DIM}`.
 
 import { TextAttributes } from '@opentui/core';
-import { useKeyboard } from '@opentui/react';
+import { useKeyboard, useTerminalDimensions } from '@opentui/react';
 import { useMemo, useState } from 'react';
 import type { Option } from '../ask/ask.js';
 import type { AskRequest } from '../ui/askBridge.js';
 import { theme } from '../ui/theme.js';
 
-const WINDOW = 12;
+const WINDOW = 7;
 
 function firstSelectable(options: Option[]): number {
   const i = options.findIndex((o) => !o.disabled);
@@ -35,7 +35,11 @@ function nextSelectable(options: Option[], from: number, dir: 1 | -1): number {
 }
 
 export function AskModal({ req }: { req: AskRequest }) {
+  const { width: columns } = useTerminalDimensions();
   const options = req.question.options;
+  const boxWidth = Math.max(20, Math.min(columns - 2, 100));
+  const compact = columns < 64;
+  const windowSize = compact ? 4 : WINDOW;
   const [idx, setIdx] = useState(() => firstSelectable(options));
 
   useKeyboard((e) => {
@@ -72,17 +76,17 @@ export function AskModal({ req }: { req: AskRequest }) {
   });
 
   const windowStart = useMemo(() => {
-    if (options.length <= WINDOW) return 0;
-    const half = Math.floor(WINDOW / 2);
+    if (options.length <= windowSize) return 0;
+    const half = Math.floor(windowSize / 2);
     let start = idx - half;
     if (start < 0) start = 0;
-    if (start + WINDOW > options.length) start = Math.max(0, options.length - WINDOW);
+    if (start + windowSize > options.length) start = Math.max(0, options.length - windowSize);
     return start;
-  }, [idx, options.length]);
+  }, [idx, options.length, windowSize]);
 
-  const visible = options.slice(windowStart, windowStart + WINDOW);
+  const visible = options.slice(windowStart, windowStart + windowSize);
   const hiddenAbove = windowStart;
-  const hiddenBelow = Math.max(0, options.length - (windowStart + WINDOW));
+  const hiddenBelow = Math.max(0, options.length - (windowStart + windowSize));
   const footer = req.question.footer ?? '↑↓ navigate · 1-9 jump · Enter select · Esc cancel';
 
   const showGroupAt = (globalIndex: number): string | undefined => {
@@ -103,7 +107,7 @@ export function AskModal({ req }: { req: AskRequest }) {
         borderColor: theme.border.focus,
         flexDirection: 'column',
         alignSelf: 'center',
-        minWidth: 56,
+        width: boxWidth,
         paddingX: 2,
         paddingY: 1,
       }}
@@ -117,13 +121,13 @@ export function AskModal({ req }: { req: AskRequest }) {
           </box>
         ) : null}
         <box style={{ flexDirection: 'row' }}>
-          <text fg={theme.text} attributes={TextAttributes.BOLD}>
+          <text fg={theme.text} attributes={TextAttributes.BOLD} truncate>
             {req.question.question}
           </text>
         </box>
-        {req.question.subtitle ? (
+        {req.question.subtitle && !compact ? (
           <box style={{ flexDirection: 'row' }}>
-            <text fg={theme.muted} attributes={TextAttributes.DIM}>
+            <text fg={theme.muted} attributes={TextAttributes.DIM} truncate>
               {req.question.subtitle}
             </text>
           </box>
@@ -137,7 +141,7 @@ export function AskModal({ req }: { req: AskRequest }) {
           </text>
         </box>
       ) : (
-        <box style={{ marginTop: 1 }} />
+        <box style={{ marginTop: compact ? 0 : 1 }} />
       )}
 
       <box style={{ flexDirection: 'column' }}>
@@ -158,12 +162,12 @@ export function AskModal({ req }: { req: AskRequest }) {
               ) : null}
               {o.disabled ? (
                 <box style={{ flexDirection: 'row' }}>
-                  <text fg={theme.muted} attributes={TextAttributes.DIM}>
+                  <text fg={theme.muted} attributes={TextAttributes.DIM} truncate>
                     {o.label}
                   </text>
                 </box>
               ) : (
-                <box style={{ flexDirection: 'row', width: '100%' }}>
+                <box style={{ flexDirection: 'row', width: '100%', overflow: 'hidden' }}>
                   <text
                     fg={selected ? theme.focus : theme.text}
                     attributes={selected ? TextAttributes.BOLD : undefined}
@@ -172,7 +176,7 @@ export function AskModal({ req }: { req: AskRequest }) {
                     {selected ? ` ${theme.glyphs.caret} ` : '   '}
                     {o.label}
                   </text>
-                  {o.badge ? (
+                  {o.badge && !compact ? (
                     <text
                       fg={selected ? theme.focus : theme.muted}
                       attributes={selected ? undefined : TextAttributes.DIM}
@@ -181,8 +185,8 @@ export function AskModal({ req }: { req: AskRequest }) {
                       {o.badge}
                     </text>
                   ) : null}
-                  {o.description ? (
-                    <text fg={theme.muted} attributes={TextAttributes.DIM}>
+                  {o.description && !compact ? (
+                    <text fg={theme.muted} attributes={TextAttributes.DIM} truncate>
                       {'  '}
                       {o.description}
                     </text>
@@ -202,9 +206,9 @@ export function AskModal({ req }: { req: AskRequest }) {
         </box>
       ) : null}
 
-      <box style={{ flexDirection: 'row', marginTop: 1 }}>
+      <box style={{ flexDirection: 'row', marginTop: compact ? 0 : 1 }}>
         <text fg={theme.muted} attributes={TextAttributes.DIM}>
-          {footer}
+          {compact ? '↑↓ navigate · Enter select · Esc cancel' : footer}
         </text>
       </box>
     </box>

@@ -404,6 +404,24 @@ describe('state.reducer tool-call preview', () => {
     expect(last?.text).toContain('$ printf line1 line2 col');
     expect(last?.text).not.toContain('\t');
   });
+
+  it('redacts secrets even when ANSI styling is embedded in tool args', () => {
+    const secret = `sk-${'a'.repeat(24)}`;
+    const styled = `sk-${ESC}[31m${'a'.repeat(12)}${ESC}[0m${'a'.repeat(12)}`;
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: 'secret-1',
+        name: 'shell',
+        args: {},
+        argsJSON: JSON.stringify({ command: `echo ${styled}` }),
+      },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.text).not.toContain(secret);
+    expect(last?.text).toContain('[REDACTED:');
+  });
 });
 
 describe('state.reducer streaming / committed-live split', () => {

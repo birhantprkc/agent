@@ -25,6 +25,11 @@ export interface AnsiSpan {
 
 const ESC = String.fromCharCode(27);
 const SGR_RE = new RegExp(`${ESC}\\[([0-9;]*)m`, 'g');
+const NON_SGR_CONTROL_RE = new RegExp(
+  `${ESC}(?:\\][^\\x07]*(?:\\x07|${ESC}\\\\)|\\[(?![0-9;]*m)[0-?]*[ -/]*[@-~]|[@-Z\\\\-_])`,
+  'g',
+);
+const C1_CONTROL_RE = /\x9b[0-?]*[ -/]*[@-~]|\x9d[^\x9c]*(?:\x9c|$)|[\x80-\x9f]/g;
 
 const BASIC_FG: Record<number, string> = {
   30: 'black',
@@ -126,13 +131,14 @@ export function xterm256ToColor(index: number): string {
 
 /** Visible width of a string after ANSI SGR escapes are stripped. */
 export function stripAnsi(s: string): string {
-  return s.replace(SGR_RE, '');
+  return s.replace(NON_SGR_CONTROL_RE, '').replace(C1_CONTROL_RE, '').replace(SGR_RE, '');
 }
 
 /** Decode a chalk/cli-highlight string into styled segments. Safe on plain
  *  text with no ANSI at all — returns a single unstyled segment. */
 export function ansiToSpans(s: string): AnsiSpan[] {
   if (!s) return [];
+  const safe = s.replace(NON_SGR_CONTROL_RE, '').replace(C1_CONTROL_RE, '');
   const spans: AnsiSpan[] = [];
   let state = freshState();
   let lastIndex = 0;
@@ -151,9 +157,9 @@ export function ansiToSpans(s: string): AnsiSpan[] {
     });
   };
 
-  let match: RegExpExecArray | null = SGR_RE.exec(s);
+  let match: RegExpExecArray | null = SGR_RE.exec(safe);
   while (match !== null) {
-    if (match.index > lastIndex) flush(s.slice(lastIndex, match.index));
+    if (match.index > lastIndex) flush(safe.slice(lastIndex, match.index));
     const codes = (match[1] ?? '')
       .split(';')
       .filter((c) => c.length > 0)
@@ -192,8 +198,8 @@ export function ansiToSpans(s: string): AnsiSpan[] {
       else if (code !== undefined && BASIC_BG[code]) state.bg = BASIC_BG[code];
     }
     lastIndex = SGR_RE.lastIndex;
-    match = SGR_RE.exec(s);
+    match = SGR_RE.exec(safe);
   }
-  if (lastIndex < s.length) flush(s.slice(lastIndex));
+  if (lastIndex < safe.length) flush(safe.slice(lastIndex));
   return spans;
 }

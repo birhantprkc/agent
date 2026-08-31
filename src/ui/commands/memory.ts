@@ -2,23 +2,29 @@
 // read/mutate the agent's curated-memory, session-memory, intelligence, and
 // user-profile stores.
 
-import type { SlashContext } from './context.js';
+import { type SlashContext, confirmDestructive } from './context.js';
 
 export function handleMemory(ctx: SlashContext): void {
   const { agent, rest, dispatch } = ctx;
   const sub = (rest[0] ?? '').toLowerCase();
   if (sub === 'clear') {
-    void agent
-      .clearMemory()
-      .then(() =>
-        dispatch({ type: 'append', entry: { kind: 'system', text: 'session memory cleared' } }),
-      )
-      .catch((err: unknown) =>
-        dispatch({
-          type: 'append',
-          entry: { kind: 'error', text: `/memory clear: ${String(err)}` },
-        }),
-      );
+    confirmDestructive(
+      ctx,
+      'Clear session memory?',
+      'This removes the current session checkpoint.',
+      () =>
+        void agent
+          .clearMemory()
+          .then(() =>
+            dispatch({ type: 'append', entry: { kind: 'system', text: 'session memory cleared' } }),
+          )
+          .catch((err: unknown) =>
+            dispatch({
+              type: 'append',
+              entry: { kind: 'error', text: `/memory clear: ${String(err)}` },
+            }),
+          ),
+    );
     return;
   }
   if (sub === 'forget') {
@@ -107,11 +113,17 @@ export function handleMemory(ctx: SlashContext): void {
         return;
       }
       const which = rawScope as 'project' | 'personal' | 'all';
-      void agent.clearIntelligence(which).then(() =>
-        dispatch({
-          type: 'append',
-          entry: { kind: 'system', text: `intelligence cleared (${which})` },
-        }),
+      confirmDestructive(
+        ctx,
+        `Clear ${which} intelligence?`,
+        'Learned findings will be permanently removed.',
+        () =>
+          void agent.clearIntelligence(which).then(() =>
+            dispatch({
+              type: 'append',
+              entry: { kind: 'system', text: `intelligence cleared (${which})` },
+            }),
+          ),
       );
       return;
     }
@@ -160,14 +172,23 @@ export function handleUser(ctx: SlashContext): void {
   const { agent, rest, dispatch } = ctx;
   const sub = (rest[0] ?? '').toLowerCase();
   if (sub === 'clear') {
-    void agent
-      .clearUserProfile()
-      .then(() =>
-        dispatch({ type: 'append', entry: { kind: 'system', text: 'user profile cleared' } }),
-      )
-      .catch((err: unknown) =>
-        dispatch({ type: 'append', entry: { kind: 'error', text: `/user clear: ${String(err)}` } }),
-      );
+    confirmDestructive(
+      ctx,
+      'Clear user profile?',
+      'This removes all saved profile notes.',
+      () =>
+        void agent
+          .clearUserProfile()
+          .then(() =>
+            dispatch({ type: 'append', entry: { kind: 'system', text: 'user profile cleared' } }),
+          )
+          .catch((err: unknown) =>
+            dispatch({
+              type: 'append',
+              entry: { kind: 'error', text: `/user clear: ${String(err)}` },
+            }),
+          ),
+    );
     return;
   }
   if (sub === 'add') {

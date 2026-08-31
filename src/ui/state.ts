@@ -4,6 +4,7 @@
 
 import type { AgentEvent, TodoItem } from '../agent/events.js';
 import { formatUserError } from '../llm/errors.js';
+import { apply as redact } from '../redact/redact.js';
 import { formatChildProgressDetail, formatChildProgressSummary } from '../tools/delegate.js';
 import { displayToolName, formatToolResult, primaryToolArg } from '../tools/toolDisplay.js';
 import type { BannerData } from './Banner.js';
@@ -402,7 +403,8 @@ function formatFindingCard(argsJSON: string): { text: string; color: string } | 
   } catch {
     return null;
   }
-  const str = (k: string): string => (typeof a[k] === 'string' ? (a[k] as string) : '');
+  const str = (k: string): string =>
+    typeof a[k] === 'string' ? redact(stripControlSequences(a[k] as string)) : '';
   const title = str('title');
   if (!title) return null;
   const severity = str('severity').toLowerCase();
@@ -547,6 +549,25 @@ function parseToolArgs(argsJSON: string): Record<string, unknown> {
     return JSON.parse(argsJSON) as Record<string, unknown>;
   } catch {
     return {};
+  }
+}
+
+function safeToolArgsJSON(argsJSON: string): string {
+  try {
+    const value: unknown = JSON.parse(argsJSON);
+    const sanitize = (item: unknown): unknown => {
+      if (typeof item === 'string') return redact(stripControlSequences(item));
+      if (Array.isArray(item)) return item.map(sanitize);
+      if (item && typeof item === 'object') {
+        return Object.fromEntries(
+          Object.entries(item).map(([key, child]) => [key, sanitize(child)]),
+        );
+      }
+      return item;
+    };
+    return JSON.stringify(sanitize(value));
+  } catch {
+    return redact(stripControlSequences(argsJSON));
   }
 }
 
@@ -904,11 +925,12 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
     case 'assistant-delta':
       return reducer(state, { type: 'append-delta', text: ev.text });
     case 'tool-call': {
+      const safeArgsJSON = safeToolArgsJSON(ev.argsJSON);
       // confirm_finding gets a first-class, severity-colored finding card
       // instead of a generic tool-call line — the headline output of an
       // engagement should stand out, not read like any other tool call.
       if (ev.name === 'confirm_finding') {
-        const card = formatFindingCard(ev.argsJSON);
+        const card = formatFindingCard(safeArgsJSON);
         if (card) {
           return {
             ...state,
@@ -917,7 +939,7 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
               { kind: 'finding', text: card.text, color: card.color, prefix: '★ ' },
             ],
             phase: 'running-tool',
-            runningTool: runningToolLabel(ev.name, ev.argsJSON),
+            runningTool: runningToolLabel(ev.name, safeArgsJSON),
           };
         }
       }
@@ -927,14 +949,14 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
           ...state.transcript,
           {
             kind: 'tool-call',
-            text: formatToolCallText(ev.name, ev.argsJSON),
+            text: formatToolCallText(ev.name, safeArgsJSON),
             // ROLE_STYLES already uses ⏺ for tool-call; keep explicit for clarity.
             prefix: '⏺ ',
             color: toolCallColor(ev.name),
           },
         ],
         phase: 'running-tool',
-        runningTool: runningToolLabel(ev.name, ev.argsJSON),
+        runningTool: runningToolLabel(ev.name, safeArgsJSON),
       };
     }
     case 'tool-result': {
@@ -945,7 +967,10 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
         return {
           ...state,
           phase: 'answering',
-          transcript: [...state.transcript, { kind: 'tool-result', text: ev.result }],
+          transcript: [
+            ...state.transcript,
+            { kind: 'tool-result', text: redact(stripControlSequences(ev.result)) },
+          ],
         };
       }
 
@@ -985,7 +1010,10 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
             phase: 'answering',
             transcript: [
               ...state.transcript,
-              { kind: 'tool-result', text: `${prefix}\n${friendly}` },
+              {
+                kind: 'tool-result',
+                text: `${prefix}\n${redact(stripControlSequences(friendly))}`,
+              },
             ],
           };
         }

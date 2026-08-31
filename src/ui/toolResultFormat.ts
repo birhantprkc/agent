@@ -7,6 +7,7 @@
 
 import { Chalk } from 'chalk';
 import { highlight } from 'cli-highlight';
+import { apply as redact } from '../redact/redact.js';
 import { chalkLevel } from './colorLevel.js';
 
 const chalk = new Chalk({ level: chalkLevel() });
@@ -232,12 +233,13 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // ---------------------------------------------------------------------------
 // biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally matching control bytes to strip them
 const ESC_SEQUENCE_RE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|[[?][0-9;:]*[a-zA-Z]|[@-Z\\-_])/g;
+const C1_CONTROL_RE = /\x9b[0-?]*[ -/]*[@-~]|\x9d[^\x9c]*(?:\x9c|$)|[\x80-\x9f]/g;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally matching control bytes to strip them
 const OTHER_CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
 /** Strip ANSI/OSC escape sequences and other control bytes from untrusted text. */
 export function stripControlSequences(s: string): string {
-  return s.replace(ESC_SEQUENCE_RE, '').replace(OTHER_CONTROL_RE, '');
+  return s.replace(ESC_SEQUENCE_RE, '').replace(C1_CONTROL_RE, '').replace(OTHER_CONTROL_RE, '');
 }
 
 /**
@@ -279,7 +281,9 @@ function formatBytes(n: number): string {
  * both views. Short results return `collapsible: false` with preview === full.
  */
 export function buildToolResultView(raw: string): ToolResultView {
-  const content = stripControlSequences(compactShellResultForTranscript(extractTextContent(raw)));
+  const content = redact(
+    stripControlSequences(compactShellResultForTranscript(extractTextContent(raw))),
+  );
   const colorize: (s: string) => string = looksLikeShellResult(content)
     ? colorizeShellResult
     : looksLikeHTTPResult(content)

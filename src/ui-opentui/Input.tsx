@@ -12,6 +12,7 @@
 import { TextAttributes } from '@opentui/core';
 import { useTerminalDimensions } from '@opentui/react';
 import type { ReactNode } from 'react';
+import { cellWidth, graphemes, sliceToCells } from '../ui/terminalWidth.js';
 import { theme } from '../ui/theme.js';
 import { positionOf } from '../ui/useTextField.js';
 
@@ -35,13 +36,33 @@ const DEFAULT_HINT: string | undefined = undefined;
 
 /** Split a single logical line into physical chunks of at most `maxCols`. */
 export function softWrapLine(text: string, maxCols: number): string[] {
+  return wrapLine(text, maxCols).map((chunk) => chunk.text);
+}
+
+function wrapLine(
+  text: string,
+  maxCols: number,
+): Array<{ text: string; start: number; startCol: number; endCol: number }> {
   const w = Math.max(1, maxCols);
-  if (text.length === 0) return [''];
-  const out: string[] = [];
-  for (let i = 0; i < text.length; i += w) {
-    out.push(text.slice(i, i + w));
+  if (text.length === 0) return [{ text: '', start: 0, startCol: 0, endCol: 0 }];
+  const out: Array<{ text: string; start: number; startCol: number; endCol: number }> = [];
+  let row = '';
+  let start = 0;
+  let startCol = 0;
+  let rowCol = 0;
+  for (const grapheme of graphemes(text)) {
+    if (row && cellWidth(row + grapheme) > w) {
+      out.push({ text: row, start, startCol, endCol: startCol + rowCol });
+      start += row.length;
+      startCol += rowCol;
+      row = '';
+      rowCol = 0;
+    }
+    row += grapheme;
+    rowCol += cellWidth(grapheme);
   }
-  return out.length > 0 ? out : [''];
+  if (row) out.push({ text: row, start, startCol, endCol: startCol + rowCol });
+  return out.length > 0 ? out : [{ text: '', start: 0, startCol: 0, endCol: 0 }];
 }
 
 /** Pad string to `n` cells with trailing spaces (for column alignment). */
@@ -63,7 +84,7 @@ export function Input(props: InputProps) {
   const showCursor = true;
   // Hang-indent width matches the first-line prompt so wrapped body text
   // starts in the same column as the first character after ❯.
-  const hangPad = ' '.repeat(promptText.length);
+  const hangPad = ' '.repeat(cellWidth(promptText));
 
   if (isEmpty) {
     return (
@@ -72,7 +93,11 @@ export function Input(props: InputProps) {
           <box style={{ flexDirection: 'row' }}>
             <text fg={theme.brand}>{promptText}</text>
             <text fg={theme.muted} attributes={TextAttributes.DIM}>
-              {truncateTo(placeholderText, Math.max(1, innerWidth - promptText.length - 1))}
+              {sliceToCells(
+                placeholderText,
+                Math.max(1, innerWidth - cellWidth(promptText) - 1),
+                '…',
+              )}
             </text>
             {showCursor ? <text fg={theme.brand}>{theme.glyphs.cursor}</text> : null}
           </box>
@@ -105,34 +130,21 @@ export function Input(props: InputProps) {
     const firstPrefix = lineIdx === 0 ? promptText : CONTINUATION_INDENT;
     // Content budget is always relative to the first-line prefix width so
     // soft-wrapped rows of multi-line drafts stay the same content width.
-    const maxCols = Math.max(1, innerWidth - promptText.length);
-    const chunks = softWrapLine(lineText, maxCols);
+    const maxCols = Math.max(1, innerWidth - cellWidth(promptText));
+    const chunks = wrapLine(lineText, maxCols);
+    const lineStartOffset = lineIdx === 0 ? 0 : lines.slice(0, lineIdx).join('\n').length + 1;
+    const cursorOffset = props.cursor - lineStartOffset;
     const isActive = lineIdx === cursorLine;
     chunks.forEach((chunk, ci) => {
       const prefix = ci === 0 ? firstPrefix : hangPad;
-      const start = ci * maxCols;
-      const end = start + chunk.length;
       let cursorAt: number | null = null;
-      if (isActive && cursorCol >= start && cursorCol <= end) {
-        if (
-          cursorCol < end ||
-          (cursorCol === end && (ci === chunks.length - 1 || chunk.length < maxCols))
-        ) {
-          cursorAt = cursorCol - start;
-        }
-      }
-      if (
-        isActive &&
-        cursorCol === lineText.length &&
-        ci === chunks.length - 1 &&
-        cursorAt === null
-      ) {
-        cursorAt = chunk.length;
+      if (isActive && cursorCol >= chunk.startCol && cursorCol <= chunk.endCol) {
+        cursorAt = Math.max(0, Math.min(chunk.text.length, cursorOffset - chunk.start));
       }
       phys.push({
         key: `L${lineIdx}-c${ci}`,
         prefix,
-        text: chunk,
+        text: chunk.text,
         cursorAt,
       });
     });

@@ -31,6 +31,7 @@ import {
   OPENROUTER_DEFAULT_BASE_URL,
   OPENROUTER_RECOMMENDED_MODELS,
 } from '../../llm/providers.js';
+import { apply as redact } from '../../redact/redact.js';
 import type { ApplyProvider } from '../appTypes.js';
 import type { AskRequest } from '../askBridge.js';
 import type { SecretInputRequest } from '../secretInput.js';
@@ -41,6 +42,7 @@ import type { SlashContext } from './context.js';
 export const CUSTOM_MODEL_OPTION = '✦ Enter custom model id…';
 const CUSTOM_OPENAI_SCHEME = 'Custom OpenAI scheme';
 const CUSTOM_ANTHROPIC_SCHEME = 'Custom Anthropic scheme';
+let modelLoadGeneration = 0;
 
 export function handleProvider(ctx: SlashContext): void {
   openProviderPicker(ctx.dispatch, ctx.readConfig, ctx.applyProvider, ctx.promptSecret);
@@ -833,7 +835,7 @@ async function setupCustomScheme(
       customModels: config.customModels,
       promptSecret,
       successText: (picked) =>
-        `provider set to custom ${schemeLabel} · ${baseURL} · model ${picked}`,
+        `provider set to custom ${schemeLabel} · ${redact(baseURL)} · model ${picked}`,
     });
   } catch {
     dispatch({
@@ -856,18 +858,38 @@ async function fetchAndPickModel(
     successText?: (picked: string) => string;
   },
 ): Promise<void> {
+  const generation = ++modelLoadGeneration;
+  dispatch({
+    type: 'set-ask',
+    req: {
+      question: {
+        header: 'Models',
+        question: `Fetching models · ${backendLabel(backend)}`,
+        subtitle: 'The provider is responding…',
+        footer: 'Esc cancel',
+        options: [{ label: 'Loading model catalog…', disabled: true }],
+      },
+      resolve: () => undefined,
+      reject: () => {
+        modelLoadGeneration += 1;
+        dispatch({ type: 'set-ask', req: null });
+      },
+    },
+  });
   let models: string[] = [];
   try {
     models = await listModels(backend, baseURL, apiKey);
   } catch (err) {
+    if (generation !== modelLoadGeneration) return;
     dispatch({
       type: 'append',
       entry: {
         kind: 'system',
-        text: `${backend} list-models failed: ${(err as Error).message} — you can still enter a custom model id.`,
+        text: `${backend} list-models failed: ${redact((err as Error).message)} — you can still enter a custom model id.`,
       },
     });
   }
+  if (generation !== modelLoadGeneration) return;
   const currentModel = opts?.currentModel;
   const remembered = opts?.customModels ?? [];
   // Prefer: current → remembered customs → live catalog (deduped).

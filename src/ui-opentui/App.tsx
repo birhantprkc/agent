@@ -93,8 +93,7 @@ const CONTEXT_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
 //   modal — permission/ask/skills/secret (detail height-capped)
 const FOOTER_IDLE = 5;
 const FOOTER_WITH_MENU = 11;
-/** Base chrome for skills/ask/secret modals (no huge shell body). */
-const FOOTER_MODAL = 14;
+const FOOTER_MODAL = 22;
 const CHAT_MIN_HEIGHT = 3;
 
 export function App({
@@ -760,7 +759,12 @@ export function App({
         }
         const picked = slashMatches[slashIdx];
         if (picked) {
-          input.setValue(picked.args ? `${picked.name} ` : picked.name);
+          if (picked.args) {
+            input.setValue(`${picked.name} `);
+          } else {
+            input.clear();
+            submit(picked.name);
+          }
           return;
         }
       }

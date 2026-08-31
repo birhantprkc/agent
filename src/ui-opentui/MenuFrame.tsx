@@ -9,7 +9,9 @@
 //   paddingX/paddingY/paddingTop/paddingBottom/marginTop/minWidth/alignSelf all keep the same names.
 
 import { TextAttributes } from '@opentui/core';
+import { useTerminalDimensions } from '@opentui/react';
 import type { ReactNode } from 'react';
+import { sliceToCells } from '../ui/terminalWidth.js';
 import { theme } from '../ui/theme.js';
 
 export interface MenuFrameProps {
@@ -31,6 +33,8 @@ export function MenuFrame({
   children,
   minWidth = 48,
 }: MenuFrameProps) {
+  const { width: columns } = useTerminalDimensions();
+  const frameWidth = Math.max(20, Math.min(minWidth, columns - 2));
   return (
     <box
       style={{
@@ -39,7 +43,7 @@ export function MenuFrame({
         borderStyle: 'rounded',
         borderColor: theme.border.focus,
         alignSelf: 'center',
-        minWidth,
+        width: frameWidth,
         paddingX: 1,
         paddingY: 0,
       }}
@@ -101,6 +105,7 @@ export function MenuRow({
   secondary?: string;
   icon?: string;
 }) {
+  const { width: columns } = useTerminalDimensions();
   const caret = selected ? `${theme.glyphs.caret} ` : '  ';
   const iconPart = icon ? `${icon} ` : '';
   const primaryBody = iconPart + primary;
@@ -113,8 +118,11 @@ export function MenuRow({
         ? `${primaryBody.slice(0, PRIMARY_COL - 1)}…`
         : primaryBody + ' '.repeat(PRIMARY_COL - primaryBody.length);
   }
+  const secondaryText = secondary
+    ? `  ${sliceToCells(secondary, Math.max(1, columns - PRIMARY_COL - 8), '…')}`
+    : undefined;
   return (
-    <box style={{ flexDirection: 'row', paddingX: 1 }}>
+    <box style={{ flexDirection: 'row', paddingX: 1, width: '100%', overflow: 'hidden' }}>
       <text
         fg={selected ? theme.focus : theme.text}
         attributes={selected ? TextAttributes.BOLD : TextAttributes.DIM}
@@ -125,8 +133,7 @@ export function MenuRow({
       </text>
       {secondary ? (
         <text fg={theme.muted} attributes={TextAttributes.DIM} truncate>
-          {'  '}
-          {secondary}
+          {secondaryText}
         </text>
       ) : null}
     </box>

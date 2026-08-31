@@ -8,6 +8,7 @@
 import type { Agent, AgentRunOptions } from '../../agent/agent.js';
 import type { Backend } from '../../config/config.js';
 import type { ApplyProvider, PersistDisabledSkills } from '../appTypes.js';
+import type { AskRequest } from '../askBridge.js';
 import type { SecretInputRequest } from '../secretInput.js';
 import type { Action } from '../state.js';
 
@@ -48,4 +49,27 @@ export interface SlashContext {
     | undefined;
   /** Snapshot of background shell jobs for /jobs. */
   listJobs?: () => string;
+}
+
+export function confirmDestructive(
+  ctx: SlashContext,
+  question: string,
+  detail: string,
+  onConfirm: () => void,
+): void {
+  const req: AskRequest = {
+    question: {
+      header: 'Confirm action',
+      question,
+      subtitle: detail,
+      footer: '↑↓ navigate · Enter select · Esc cancel',
+      options: [{ label: 'Cancel' }, { label: 'Continue' }],
+    },
+    resolve: (picked) => {
+      ctx.dispatch({ type: 'set-ask', req: null });
+      if (picked === 'Continue') onConfirm();
+    },
+    reject: () => ctx.dispatch({ type: 'set-ask', req: null }),
+  };
+  ctx.dispatch({ type: 'set-ask', req });
 }

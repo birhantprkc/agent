@@ -42,10 +42,30 @@ export function compactPath(path: string, maxLen: number): string {
     const sep = i === parts.length - 1 ? '' : '/';
     const candidate = part + sep + result;
     if (candidate.length > maxLen) {
-      if (i === 0) return '…/' + result;
-      return '…/' + (result ? result : part);
+      if (i === 0) return `…/${result}`;
+      return `…/${result ? result : part}`;
     }
     result = candidate;
   }
   return result;
+}
+
+export function ellipsize(value: string, maxLen: number): string {
+  if (value.length <= maxLen) return value;
+  if (maxLen <= 1) return '…';
+  return `${value.slice(0, maxLen - 1)}…`;
+}
+
+export function packMetaLine(opts: {
+  provider: string;
+  ctx?: string;
+  pill?: string;
+  budget: number;
+}): string {
+  return ellipsize(
+    [opts.provider, opts.ctx, opts.pill]
+      .filter((part): part is string => Boolean(part))
+      .join(' · '),
+    opts.budget,
+  );
 }

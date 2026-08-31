@@ -560,22 +560,22 @@ output, and copied request material.
 ## Develop
 
 ```sh
-npm install
-npm run dev -- --version
-npm run dev -- --burp 9999
-npm run typecheck
-npm run lint
-npm run test
-npm run build
-node dist/cli.js
+bun install
+bun run dev -- --version
+bun run dev -- --burp 9999
+bun run typecheck
+bun run lint
+bun run test
+bun run build
+bun dist/cli.js
 ```
 
-`npm run ci` runs typecheck, lint, tests, and build.
+`bun run ci` runs typecheck, lint, tests, and build.
 
 ## Contributing
 
 Issues and pull requests are welcome. Keep changes focused, include tests for
-behavioral updates, and run `npm run ci` before opening a pull request. New
+behavioral updates, and run `bun run ci` before opening a pull request. New
 skills should include a `SKILL.md` and pass the skill conformance tests.
 
 ## License

@@ -43,12 +43,12 @@ async function renderFrame(props: Partial<Parameters<typeof ChatPane>[0]> = {}):
 }
 
 describe('ChatPane', () => {
-  it('shows empty-state guidance when the log is empty', async () => {
+  it('keeps the empty chat pane free of a personalized greeting', async () => {
     const text = await renderFrame({ committed: [] });
     expect(text).toContain('PF');
-    expect(text).toMatch(/Hello |Pwn The World|🧑‍💻/i);
-    // Machine username (or fallback) is injected into the greeting.
-    expect(text).toMatch(/Hello \S+, Let's Pwn The World/);
+    expect(text).not.toContain('Hello ');
+    expect(text).not.toContain('The World');
+    expect(text).not.toContain('🧑‍💻');
   });
 
   it('shows the banner once above the scrollable log', async () => {

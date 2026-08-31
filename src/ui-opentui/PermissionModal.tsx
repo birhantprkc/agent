@@ -85,8 +85,8 @@ export function PermissionModal({
 
   const shell = isShellTool(req.tool);
   const asCommand = isCommandTool(req.tool);
-  const boxWidth = Math.max(36, Math.min(maxWidth, 100));
-  const lineCols = Math.max(24, boxWidth - 8);
+  const boxWidth = Math.max(20, Math.min(maxWidth, 100));
+  const lineCols = Math.max(8, boxWidth - 8);
 
   const commandBody = asCommand
     ? req.detail?.trim() || req.summary || ''
